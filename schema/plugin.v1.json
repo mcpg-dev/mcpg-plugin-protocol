@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mcpg.dev/schema/plugin/v1",
+  "title": "MCPG plugin descriptor — schema v1",
+  "description": "JSON Schema for `plugin.yaml` files conforming to `mcpg.dev/plugin/v1`. Matches the `PluginDescriptor` struct in `libs/plugin-protocol/src/descriptor.rs`. Normative; the gateway rejects descriptors that fail validation. See https://mcpg.dev/docs/plugins/plugins-and-protocol for the semantic contract each field carries.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "id", "name", "class", "runtime", "protocol_version"],
+  "properties": {
+    "schema": {
+      "description": "Schema identifier. MUST be the literal `mcpg.dev/plugin/v1`. Future schemas bump this field before any other breaking change.",
+      "type": "string",
+      "const": "mcpg.dev/plugin/v1"
+    },
+    "id": {
+      "description": "Reverse-DNS plugin identifier, MUST be globally unique. MUST equal the in-code `PluginManifest.id`. Lowercase; dot-separated; each segment is `[a-z0-9][a-z0-9_-]*`; at least two segments. Case-sensitive. Convention: `dev.mcpg.<short>` for first-party, `<vendor-tld>.<vendor>.<name>` for third-party.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(\\.[a-z0-9][a-z0-9_-]*)+$",
+      "minLength": 3,
+      "maxLength": 255
+    },
+    "name": {
+      "description": "Human-readable display name. Shown in admin surfaces.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "license": {
+      "description": "SPDX license identifier of the plugin's source license (e.g. `Apache-2.0`). Informational — surfaced to catalogs / marketplaces and admin inventory; the gateway does not act on it.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "description": {
+      "description": "Free-form long description. Shown in admin surfaces and plugin catalogues.",
+      "type": "string"
+    },
+    "class": {
+      "description": "Entity kind this plugin provides.",
+      "type": "string",
+      "enum": [
+        "tool_gate",
+        "transform",
+        "identity_provider",
+        "backend",
+        "watch_strategy",
+        "http_route",
+        "audit_sink",
+        "store",
+        "cache",
+        "telemetry_sink",
+        "log_sink",
+        "metrics_sink",
+        "secret_provider",
+        "config_provider",
+        "transport",
+        "policy_engine",
+        "cluster",
+        "catalog_provider",
+        "credential_issuer",
+        "approval_notifier",
+        "content_store"
+      ]
+    },
+    "runtime": {
+      "description": "Runtime class. Determines how the gateway loads the plugin. `static-firstparty-v1` is reserved for foundational plugins (the testing tier + gateway built-ins); external plugins MUST declare `native-cdylib-v1` or `wasi-v1`.",
+      "type": "string",
+      "enum": [
+        "static-firstparty-v1",
+        "native-cdylib-v1",
+        "wasi-v1"
+      ]
+    },
+    "protocol_version": {
+      "description": "Plugin protocol version this plugin targets, as a semver string. Currently `1.0`. The host loads a plugin only if the declared version falls within its supported range.",
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+(\\.\\d+)?(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "required_capabilities": {
+      "description": "Typed host capabilities the plugin needs. Each entry is either a bare string for no-args variants (e.g. \"network_outbound\") or an object with `type` + variant args (e.g. {type: \"filesystem_read\", paths: [\"/etc/myapp\"]}). The gateway refuses to start if any required capability is not covered by the operator's `plugins[].granted_capabilities` grant set.",
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "enum": [
+              "audit_write",
+              "cluster_leadership_acquire",
+              "cluster_lock_acquire",
+              "cluster_peer_read",
+              "http_route_serve",
+              "metric_emit",
+              "network_outbound",
+              "transport_listen",
+              "unbounded_subscriptions"
+            ]
+          },
+          {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "const": "audit_write"}}, "additionalProperties": false},
+          {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "const": "cluster_leadership_acquire"}}, "additionalProperties": false},
+          {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "const": "cluster_lock_acquire"}}, "additionalProperties": false},
+          {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "const": "cluster_peer_read"}}, "additionalProperties": false},
+          {"type": "object", "required": ["type", "schemes"], "properties": {"type": {"type": "string", "const": "config_read"}, "schemes": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false},
+          {"type": "object", "required": ["type", "kinds"], "properties": {"type": {"type": "string", "const": "credential_issue"}, "kinds": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false},
+          {"type": "object", "required": ["type", "paths"], "properties": {"type": {"type": "string", "const": "filesystem_read"}, "paths": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false},
+          {"type": "object", "required": ["type", "paths"], "properties": {"type": {"type": "string", "const": "filesystem_write"}, "paths": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false},
+          {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "const": "http_route_serve"}}, "additionalProperties": false},
+          {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "const": "metric_emit"}}, "additionalProperties": false},
+          {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "const": "network_outbound"}}, "additionalProperties": false},
+          {"type": "object", "required": ["type", "schemes"], "properties": {"type": {"type": "string", "const": "secrets_read"}, "schemes": {"type": "array", "items": {"type": "string"}}}, "additionalProperties": false},
+          {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "const": "transport_listen"}}, "additionalProperties": false},
+          {"type": "object", "required": ["type"], "properties": {"type": {"type": "string", "const": "unbounded_subscriptions"}}, "additionalProperties": false}
+        ]
+      },
+      "uniqueItems": true,
+      "default": []
+    },
+    "tags": {
+      "description": "Free-form classification tags. Plugin authors declare labels like `enterprise`, `paid`, `experimental`, `security-critical`, `vendor:hashicorp`. Operators wire these into a `policy_engine` chain at the `plugin.lifecycle.register` decision point so the engine can deny / allow plugin loading per their org's rules. No well-known enum — operators define their own scheme.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 64
+      },
+      "uniqueItems": true,
+      "default": []
+    },
+    "provides": {
+      "description": "Cluster slot roles this plugin provides. Used by `cluster` plugins to declare which gateway slots they can back — one or more of `cache` / `kv` / `bus`. Empty / absent for non-cluster plugin classes. The gateway cross-checks this list against the runtime `ClusterBackend::cluster_provides()` and the wiring fallback table at boot and fails-closed on drift. (Slot-role vocabulary, distinct from the trait's primitive accessor methods key_value_store / pub_sub / lease / watch.)",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "cache",
+          "kv",
+          "bus"
+        ]
+      },
+      "uniqueItems": true,
+      "default": []
+    },
+    "provides_schemes": {
+      "description": "URI schemes this plugin claims for auto-routing (Layout D'' P8). Required for `secret_provider` and `config_provider` plugin classes — those classes route by URI scheme prefix only. Conflicts (two plugins claiming the same scheme) refuse boot. Built-in `env` and `file` schemes are reserved.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 32
+      },
+      "uniqueItems": true,
+      "default": []
+    }
+  }
+}

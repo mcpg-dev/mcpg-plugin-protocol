@@ -1,0 +1,46 @@
+[package]
+name = "mcpg-plugin-protocol"
+version = "0.1.0-beta.13"
+license = "Apache-2.0"
+edition = "2024"
+description = "The versioned MCPG plugin protocol: types, trait contracts, and compatibility identifiers"
+
+# Ship `schema/plugin.v1.json` alongside the crate so downstream
+# tooling (IDE integrations, CI `mcpg-plugin` checks, third-party
+# linters) can reference the JSON Schema from a published version of
+# this crate without cloning the workspace. Cargo's default `include`
+# would otherwise skip non-`src/` files.
+include = [
+    "src/**/*.rs",
+    "schema/**/*.json",
+    "Cargo.toml",
+]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+# `identity_hash` uses a 256-bit cryptographic digest over a canonical
+# field encoding so the credential-cache key is collision-resistant.
+sha2 = "0.10"
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+abi_stable = "0.11"
+# `http_route` module — `Bytes` is the canonical body type (shared
+# with axum + hyper + reqwest), and `futures-core::Stream` keeps the
+# streaming-body trait object transport-agnostic without pulling in
+# the full `futures` crate.
+bytes = { version = "1", features = ["serde"] }
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+# `content_store` entity types carry chrono timestamps on the in-process
+# trait surface (the FFI vtable has its own RFC3339-string wire encoding).
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+# `futures` (full crate) — provides `stream::once` for the
+# default `BackendPlugin::execute_streaming` impl that wraps the
+# non-streaming `execute`. Cheap (futures-util only). Plugin
+# authors who don't override the default never touch it.
+futures = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
