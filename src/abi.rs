@@ -32,6 +32,7 @@
 //! mediation-chain semantics, which already bound every plugin call with a
 //! per-step timeout.
 
+use abi_stable::std_types::Tuple2;
 use abi_stable::{
     StableAbi,
     std_types::{ROption, RStr, RString, RVec},
@@ -400,7 +401,15 @@ use crate::types::{
 ///     zero-copy, no ferry, ~33× on `tool_gate`). No separate "fast" slot — one
 ///     clean slot, dispatch is host policy. See `fast-slot-rollout.md`
 ///     + `benchmarks.md` §19.
-pub const MCPG_PLUGIN_ABI_VERSION: u32 = 1;
+///
+/// - v2 (first post-release bump; the counter reset to 1 on 2026-06-05):
+///   `RIdentityResolution::Invalid` gains
+///   `response_headers: RVec<Tuple2<RString, RString>>` — response headers the
+///   transport attaches to the authentication-failure response (AAuth's
+///   `Signature-Error` / `Accept-Signature-*` diagnostics). Why a bump: the
+///   new field changes the variant's binary layout, and a v1 cdylib's
+///   two-word `Invalid` must be refused at load rather than misread.
+pub const MCPG_PLUGIN_ABI_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // ABI-stable mirrors of the plugin data types
@@ -501,9 +510,16 @@ pub enum RTransformResult {
 #[derive(StableAbi, Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum RIdentityResolution {
-    Resolved { identity: RPluginIdentity },
+    Resolved {
+        identity: RPluginIdentity,
+    },
     None,
-    Invalid { reason: RString },
+    Invalid {
+        reason: RString,
+        /// `(name, value)` response headers for the resulting
+        /// authentication-failure response, lowercase names.
+        response_headers: RVec<Tuple2<RString, RString>>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -2704,8 +2720,15 @@ impl From<RIdentityResolution> for IdentityResolution {
                 identity: identity.into(),
             },
             RIdentityResolution::None => IdentityResolution::None,
-            RIdentityResolution::Invalid { reason } => IdentityResolution::Invalid {
+            RIdentityResolution::Invalid {
+                reason,
+                response_headers,
+            } => IdentityResolution::Invalid {
                 reason: reason.into_string(),
+                response_headers: response_headers
+                    .into_iter()
+                    .map(|t| (t.0.into_string(), t.1.into_string()))
+                    .collect(),
             },
         }
     }
@@ -2718,8 +2741,15 @@ impl From<IdentityResolution> for RIdentityResolution {
                 identity: (&identity).into(),
             },
             IdentityResolution::None => RIdentityResolution::None,
-            IdentityResolution::Invalid { reason } => RIdentityResolution::Invalid {
+            IdentityResolution::Invalid {
+                reason,
+                response_headers,
+            } => RIdentityResolution::Invalid {
                 reason: RString::from(reason),
+                response_headers: response_headers
+                    .into_iter()
+                    .map(|(n, v)| Tuple2(RString::from(n), RString::from(v)))
+                    .collect(),
             },
         }
     }
@@ -2817,6 +2847,7 @@ where
         Ok(r) => r,
         Err(_) => RIdentityResolution::Invalid {
             reason: RString::from(PANIC_IDENTITY_MSG),
+            response_headers: RVec::new(),
         },
     }
 }
@@ -3207,11 +3238,13 @@ mod tests {
 
     #[test]
     fn abi_version_is_current() {
-        // Internal versions are FROZEN at their initial value until the first
-        // public release (the 2026-06-05 reset; see CLAUDE.md) — the ABI
-        // version is 1, not its pre-reset value. The reset commit updated the
-        // const but missed this assertion, reddening develop CI.
-        assert_eq!(MCPG_PLUGIN_ABI_VERSION, 1);
+        // Pins the constant so a layout change cannot ship without a
+        // deliberate bump decision. v2 is the first post-release bump:
+        // `RIdentityResolution::Invalid` gained `response_headers` (see the
+        // version history above and docs/plugin-protocol/abi-changelog.md);
+        // the freeze that held the counter at 1 ended with the first public
+        // release.
+        assert_eq!(MCPG_PLUGIN_ABI_VERSION, 2);
     }
 
     /// Catch ALL_KINDS drift the moment a new `EntityRegistration`
@@ -3325,7 +3358,7 @@ mod tests {
     fn catch_panic_to_identity_invalid_returns_invalid_on_panic() {
         let r = catch_panic_to_identity_invalid(|| panic!("boom"));
         match r {
-            RIdentityResolution::Invalid { reason } => {
+            RIdentityResolution::Invalid { reason, .. } => {
                 assert!(reason.as_str().contains("panicked"))
             }
             _ => panic!("expected Invalid on caught panic"),

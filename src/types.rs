@@ -326,7 +326,15 @@ pub enum IdentityResolution {
     /// No token/credential found — fall through to next resolver.
     None,
     /// Token found but invalid.
-    Invalid { reason: String },
+    Invalid {
+        reason: String,
+        /// Response headers the transport should attach to the resulting
+        /// authentication-failure response — e.g. AAuth's `Signature-Error`
+        /// and `Accept-Signature-*` diagnostics. `(name, value)` pairs,
+        /// lowercase names. Additive field: absent means none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        response_headers: Vec<(String, String)>,
+    },
 }
 
 // ---------------------------------------------------------------------------
