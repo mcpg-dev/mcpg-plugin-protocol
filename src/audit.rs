@@ -64,6 +64,13 @@ pub struct AuditEvent {
     /// decisions); `None` for gateway-lifecycle events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    /// The caller's own correlation id — the inbound `x-request-id`
+    /// header, verbatim. Caller-chosen, so neither unique nor
+    /// trustworthy: use it to JOIN gateway audit records with the
+    /// caller's traces, never as a key. `request_id` remains the
+    /// gateway-minted collision-free identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_request_id: Option<String>,
     /// Logical node identifier when the gateway runs as part of a
     /// multi-node deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -78,6 +85,17 @@ pub struct AuditEvent {
     /// + verify the chain themselves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_event_hash: Option<String>,
+}
+
+impl AuditEvent {
+    /// Attach the caller's correlation id (inbound `x-request-id`)
+    /// to an already-built event. Chainable so emit sites can stamp
+    /// it without unpacking the event a helper returned.
+    #[must_use]
+    pub fn with_upstream_request_id(mut self, id: Option<String>) -> Self {
+        self.upstream_request_id = id;
+        self
+    }
 }
 
 /// Outcome class. Sinks often index on this for fast filter queries
@@ -236,6 +254,7 @@ mod tests {
             resource: Some("tool://payments.charge".into()),
             outcome: AuditOutcome::Denied,
             request_id: Some("req-1".into()),
+            upstream_request_id: None,
             node_id: None,
             details: serde_json::json!({"reason": "rate_limit"}),
             prev_event_hash: Some("deadbeef".repeat(8)),
@@ -307,6 +326,7 @@ mod tests {
             resource: None,
             outcome: AuditOutcome::Success,
             request_id: None,
+            upstream_request_id: None,
             node_id: None,
             details: serde_json::json!({}),
             prev_event_hash: None,

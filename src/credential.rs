@@ -415,7 +415,7 @@ pub fn identity_hash_with_attrs(identity: &PluginIdentity, key_attributes: &[Str
     }
 
     let mut h = Sha256::new();
-    h.update(b"mcpg.identity_hash.v2\0"); // domain separation
+    h.update(b"mcpg.identity_hash.v3\0"); // domain separation
     feed(&mut h, b"kind", &identity.kind);
     feed(&mut h, b"trust_level", &identity.trust_level);
     feed(
@@ -445,18 +445,28 @@ pub fn identity_hash_with_attrs(identity: &PluginIdentity, key_attributes: &[Str
             feed(&mut h, label, item);
         }
     }
-    // Fold only the present, allow-listed attributes, sorted by key so the
-    // set canonicalizes regardless of insertion order.
+    // Fold the present, allow-listed attributes, sorted by key so the
+    // set canonicalizes regardless of insertion order. `subject_token` is
+    // folded IMPLICITLY whenever present: on impersonation flows the
+    // caller's bearer IS the authority the issuer exchanges, so two
+    // bearers must never share a cached credential even when every
+    // resolved field matches — an STS may derive authority from claims
+    // the gateway does not resolve. Sharing across bearers is only ever
+    // correct when the token carries no authority beyond the resolved
+    // identity, which the host cannot know — so it does not gamble.
     let mut attrs: Vec<(&str, &str)> = key_attributes
         .iter()
+        .map(String::as_str)
+        .chain(std::iter::once("subject_token"))
         .filter_map(|k| {
             identity
                 .attributes
-                .get_key_value(k.as_str())
+                .get_key_value(k)
                 .map(|(k, v)| (k.as_str(), v.as_str()))
         })
         .collect();
     attrs.sort();
+    attrs.dedup();
     h.update((attrs.len() as u64).to_le_bytes());
     for (k, v) in attrs {
         feed(&mut h, b"attr.k", k);
@@ -731,6 +741,25 @@ mod tests {
         // The no-attribute helper and the default must be byte-identical so
         // an unset key_attributes never silently churns cache keys.
         assert_eq!(identity_hash_with_attrs(&id, &[]), identity_hash(&id));
+    }
+
+    #[test]
+    fn distinct_subject_tokens_partition_the_key_without_opt_in() {
+        let mut a = identity("alice");
+        a.attributes
+            .insert("subject_token".into(), "bearer-one".into());
+        let mut b = identity("alice");
+        b.attributes
+            .insert("subject_token".into(), "bearer-two".into());
+        assert_ne!(
+            identity_hash_with_attrs(&a, &[]),
+            identity_hash_with_attrs(&b, &[])
+        );
+        // And an operator listing it explicitly changes nothing (dedup).
+        assert_eq!(
+            identity_hash_with_attrs(&a, &[]),
+            identity_hash_with_attrs(&a, &["subject_token".to_string()])
+        );
     }
 
     #[test]
