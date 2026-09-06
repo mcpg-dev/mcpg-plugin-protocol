@@ -145,8 +145,8 @@ use crate::types::{
 ///   `try_acquire_leadership` + `try_acquire_lock` slots to
 ///   [`ClusterBackendVTable`]. Backed by matching default-
 ///   impl trait methods on [`crate::cluster::ClusterBackend`];
-///   backends with native CAS / put-if-absent (Consul, etcd,
-///   JetStream KV) override for true non-blocking semantics.
+///   backends with native CAS / put-if-absent (JetStream KV,
+///   redis) override for true non-blocking semantics.
 ///   Return convention: `LeaseHandle.handle != 0` →
 ///   acquired; `handle == 0 && error_json.is_empty()` → declined
 ///   (peer holds the lease); `handle == 0 && !error_json.is_empty()`
@@ -409,7 +409,15 @@ use crate::types::{
 ///   `Signature-Error` / `Accept-Signature-*` diagnostics). Why a bump: the
 ///   new field changes the variant's binary layout, and a v1 cdylib's
 ///   two-word `Invalid` must be refused at load rather than misread.
-pub const MCPG_PLUGIN_ABI_VERSION: u32 = 2;
+///
+/// - v3: `ClusterVTable` gains the `kv_incr` slot — the KV primitive's
+///   atomic add-and-get counter (JSON `KvIncrArgs` in, `Result<i64,
+///   ClusterError>` envelope out). Why a bump: the new function pointer
+///   changes the vtable's binary layout (and shifts `shutdown` /
+///   `drop_instance`), and the vtable is embedded **by value** in
+///   `ClusterClientRef`, so a v2 cluster cdylib must be refused at load
+///   rather than have its `shutdown` slot dispatched as `kv_incr`.
+pub const MCPG_PLUGIN_ABI_VERSION: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // ABI-stable mirrors of the plugin data types
@@ -1574,7 +1582,7 @@ pub struct ClusterVTable {
     // like `publish`. The host marshals the `KeyValueStore` trait across the
     // boundary via the JSON arg/return DTOs in
     // `mcpg_cluster_api::key_value`. A coordinator that does not back a KV
-    // (consul / etcd today) returns a `ClusterError` envelope — the host
+    // returns a `ClusterError` envelope — the host
     // exposes `key_value_store()` as `Some` only for coordinators whose
     // manifest `provides` includes the `kv` role, so these slots are never
     // reached on a non-KV coordinator.
@@ -1597,6 +1605,11 @@ pub struct ClusterVTable {
     /// Input: JSON `KvExpireArgs` (`{key, ttl_ms?}`). Output: envelope
     /// `Result<bool, ClusterError>` (`true` == the key existed).
     pub kv_expire: extern "C" fn(handle: RPluginHandle, args_json: RString) -> RString,
+    /// Input: JSON `KvIncrArgs` (`{key, delta, ttl_ms?}`). Output:
+    /// envelope `Result<i64, ClusterError>` — the post-increment value.
+    /// Atomic add-and-get: a missing key starts at 0; `ttl_ms` (when
+    /// present) re-arms the key's TTL on every call (sliding).
+    pub kv_incr: extern "C" fn(handle: RPluginHandle, args_json: RString) -> RString,
     pub shutdown: extern "C" fn(handle: RPluginHandle),
     pub drop_instance: extern "C" fn(handle: RPluginHandle),
 }
@@ -3239,12 +3252,10 @@ mod tests {
     #[test]
     fn abi_version_is_current() {
         // Pins the constant so a layout change cannot ship without a
-        // deliberate bump decision. v2 is the first post-release bump:
-        // `RIdentityResolution::Invalid` gained `response_headers` (see the
-        // version history above and docs/plugin-protocol/abi-changelog.md);
-        // the freeze that held the counter at 1 ended with the first public
-        // release.
-        assert_eq!(MCPG_PLUGIN_ABI_VERSION, 2);
+        // deliberate bump decision. v3 added `ClusterVTable::kv_incr`
+        // (see the version history above and
+        // docs/plugin-protocol/abi-changelog.md).
+        assert_eq!(MCPG_PLUGIN_ABI_VERSION, 3);
     }
 
     /// Catch ALL_KINDS drift the moment a new `EntityRegistration`
