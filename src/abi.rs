@@ -402,22 +402,26 @@ use crate::types::{
 ///     clean slot, dispatch is host policy. See `fast-slot-rollout.md`
 ///     + `benchmarks.md` §19.
 ///
-/// - v2 (first post-release bump; the counter reset to 1 on 2026-06-05):
-///   `RIdentityResolution::Invalid` gains
-///   `response_headers: RVec<Tuple2<RString, RString>>` — response headers the
-///   transport attaches to the authentication-failure response (AAuth's
-///   `Signature-Error` / `Accept-Signature-*` diagnostics). Why a bump: the
-///   new field changes the variant's binary layout, and a v1 cdylib's
-///   two-word `Invalid` must be refused at load rather than misread.
+/// - Pre-release freeze (2026-06-05 onward): the sentinel stays at **1** and
+///   wire-contract changes land IN PLACE. Everything in-tree recompiles
+///   together and nothing has shipped externally, so there is no compatibility
+///   obligation to encode. Two layout changes are folded into v1:
+///   `RIdentityResolution::Invalid` gained
+///   `response_headers: RVec<Tuple2<RString, RString>>` (the transport attaches
+///   AAuth `Signature-Error` / `Accept-Signature-*` diagnostics to an
+///   authentication-failure response), and `ClusterVTable` gained the `kv_incr`
+///   slot (the KV primitive's atomic add-and-get counter — JSON `KvIncrArgs`
+///   in, `Result<i64, ClusterError>` envelope out, shifting `shutdown` /
+///   `drop_instance`).
 ///
-/// - v3: `ClusterVTable` gains the `kv_incr` slot — the KV primitive's
-///   atomic add-and-get counter (JSON `KvIncrArgs` in, `Result<i64,
-///   ClusterError>` envelope out). Why a bump: the new function pointer
-///   changes the vtable's binary layout (and shifts `shutdown` /
-///   `drop_instance`), and the vtable is embedded **by value** in
-///   `ClusterClientRef`, so a v2 cluster cdylib must be refused at load
-///   rather than have its `shutdown` slot dispatched as `kv_incr`.
-pub const MCPG_PLUGIN_ABI_VERSION: u32 = 3;
+///   The cost of the freeze, stated plainly: both changed binary layout, so a
+///   cdylib built against an earlier v1 layout is indistinguishable from a
+///   current one at load and is misread rather than refused. Plugins are
+///   rebuilt from the same tree every release and baked beside the host, so
+///   in-tree consumers never mix; a digest-pinned artefact from an older
+///   release is the one case that can. `docs/plugin-protocol/abi-changelog.md`
+///   carries the record.
+pub const MCPG_PLUGIN_ABI_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // ABI-stable mirrors of the plugin data types
@@ -3252,10 +3256,23 @@ mod tests {
     #[test]
     fn abi_version_is_current() {
         // Pins the constant so a layout change cannot ship without a
-        // deliberate bump decision. v3 added `ClusterVTable::kv_incr`
-        // (see the version history above and
-        // docs/plugin-protocol/abi-changelog.md).
-        assert_eq!(MCPG_PLUGIN_ABI_VERSION, 3);
+        // deliberate decision. Frozen at 1 until the first public release —
+        // wire-contract changes land in place and are recorded in
+        // docs/plugin-protocol/abi-changelog.md rather than bumped.
+        assert_eq!(MCPG_PLUGIN_ABI_VERSION, 1);
+    }
+
+    /// The other half of the freeze. Both identifiers stay at 1 until the
+    /// first public release: no external artefact depends on them yet, so a
+    /// breaking change has no compatibility obligation to encode and is
+    /// applied in place. A bump here is not a version change, it is a claim
+    /// that external artefacts exist to be protected — and because the ABI
+    /// gate is strict equality and the version appears nowhere in the
+    /// artefact, it invalidates every published plugin with a load-time
+    /// refusal that names no cause.
+    #[test]
+    fn protocol_version_is_frozen() {
+        assert_eq!(crate::PROTOCOL_VERSION, "1.0");
     }
 
     /// Catch ALL_KINDS drift the moment a new `EntityRegistration`
