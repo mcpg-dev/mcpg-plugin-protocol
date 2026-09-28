@@ -376,6 +376,18 @@ pub fn substitute_cred_tokens(
 // Identity hash (cache key dimension)
 // ---------------------------------------------------------------------------
 
+/// Identity attribute carrying the subject token a credential issuer
+/// exchanges.
+pub const SUBJECT_TOKEN_ATTRIBUTE: &str = "subject_token";
+/// Identity attribute naming where the subject token came from.
+pub const SUBJECT_TOKEN_SOURCE_ATTRIBUTE: &str = "subject_token_source";
+/// [`SUBJECT_TOKEN_SOURCE_ATTRIBUTE`] of a subject token taken from the
+/// caller's enterprise IdP sign-in the host keeps.
+pub const SUBJECT_TOKEN_SOURCE_IDP_VAULT: &str = "idp_vault";
+/// Identity attribute that names the stored sign-in a vault subject token
+/// belongs to. It stays the same while the IdP rotates the token.
+pub const SUBJECT_TOKEN_BINDING_ATTRIBUTE: &str = "subject_token_binding";
+
 /// Compute a deterministic 256-bit hash of the caller's identity for
 /// use as the cache key dimension.
 ///
@@ -396,6 +408,12 @@ pub fn identity_hash(identity: &PluginIdentity) -> String {
 /// callers that differ only by those claims (commonly the tenant claim)
 /// get separate cache entries. An empty `key_attributes` is byte-identical
 /// to [`identity_hash`].
+///
+/// A subject token from the caller's stored IdP sign-in
+/// (`subject_token_source = "idp_vault"` with a `subject_token_binding`)
+/// is keyed by that binding instead of the token, so one cached
+/// credential outlives the IdP rotating the stored token. A binding
+/// without that source is ignored.
 ///
 /// Only PRESENT allow-listed keys contribute, keeping cardinality bounded
 /// to the operator-chosen claim space. The digest is SHA-256 over a
@@ -454,10 +472,23 @@ pub fn identity_hash_with_attrs(identity: &PluginIdentity, key_attributes: &[Str
     // the gateway does not resolve. Sharing across bearers is only ever
     // correct when the token carries no authority beyond the resolved
     // identity, which the host cannot know — so it does not gamble.
+    let vault_binding = identity
+        .attributes
+        .get(SUBJECT_TOKEN_SOURCE_ATTRIBUTE)
+        .is_some_and(|source| source == SUBJECT_TOKEN_SOURCE_IDP_VAULT)
+        && identity
+            .attributes
+            .contains_key(SUBJECT_TOKEN_BINDING_ATTRIBUTE);
+    let subject_key = if vault_binding {
+        SUBJECT_TOKEN_BINDING_ATTRIBUTE
+    } else {
+        SUBJECT_TOKEN_ATTRIBUTE
+    };
     let mut attrs: Vec<(&str, &str)> = key_attributes
         .iter()
         .map(String::as_str)
-        .chain(std::iter::once("subject_token"))
+        .filter(|k| !(vault_binding && *k == SUBJECT_TOKEN_ATTRIBUTE))
+        .chain(std::iter::once(subject_key))
         .filter_map(|k| {
             identity
                 .attributes
@@ -760,6 +791,75 @@ mod tests {
             identity_hash_with_attrs(&a, &[]),
             identity_hash_with_attrs(&a, &["subject_token".to_string()])
         );
+    }
+
+    fn vault_caller(token: &str, binding: &str) -> PluginIdentity {
+        let mut id = identity("alice");
+        for (key, value) in [
+            (SUBJECT_TOKEN_ATTRIBUTE, token),
+            (
+                SUBJECT_TOKEN_SOURCE_ATTRIBUTE,
+                SUBJECT_TOKEN_SOURCE_IDP_VAULT,
+            ),
+            (SUBJECT_TOKEN_BINDING_ATTRIBUTE, binding),
+        ] {
+            id.attributes.insert(key.into(), value.into());
+        }
+        id
+    }
+
+    #[test]
+    fn a_vault_subject_token_is_keyed_by_its_binding() {
+        let before = vault_caller("idp-rt-one", "vault:p1:client:refresh_token");
+        let rotated = vault_caller("idp-rt-two", "vault:p1:client:refresh_token");
+        assert_eq!(
+            identity_hash(&before),
+            identity_hash(&rotated),
+            "a rotated IdP token keeps the cached credential"
+        );
+        let subject = ["subject_token".to_string()];
+        assert_eq!(
+            identity_hash_with_attrs(&before, &subject),
+            identity_hash_with_attrs(&rotated, &subject),
+            "listing subject_token does not undo the binding"
+        );
+        let other_user = vault_caller("idp-rt-one", "vault:p2:client:refresh_token");
+        assert_ne!(identity_hash(&before), identity_hash(&other_user));
+        let id_token = vault_caller("idp-rt-one", "vault:p1:client:id_token");
+        assert_ne!(identity_hash(&before), identity_hash(&id_token));
+    }
+
+    #[test]
+    fn a_binding_without_the_vault_source_is_ignored() {
+        for source in [None, Some("caller_bearer"), Some("IDP_VAULT"), Some("")] {
+            let planted = |token: &str| {
+                let mut id = vault_caller(token, "vault:p1:client:refresh_token");
+                match source {
+                    Some(source) => {
+                        id.attributes
+                            .insert(SUBJECT_TOKEN_SOURCE_ATTRIBUTE.into(), source.into());
+                    }
+                    None => {
+                        id.attributes.remove(SUBJECT_TOKEN_SOURCE_ATTRIBUTE);
+                    }
+                }
+                id
+            };
+            assert_ne!(
+                identity_hash(&planted("bearer-one")),
+                identity_hash(&planted("bearer-two")),
+                "{source:?}: two bearers never share a credential"
+            );
+        }
+        let mut no_binding = vault_caller("idp-rt-one", "unused");
+        no_binding
+            .attributes
+            .remove(SUBJECT_TOKEN_BINDING_ATTRIBUTE);
+        let mut other = no_binding.clone();
+        other
+            .attributes
+            .insert(SUBJECT_TOKEN_ATTRIBUTE.into(), "idp-rt-two".into());
+        assert_ne!(identity_hash(&no_binding), identity_hash(&other));
     }
 
     #[test]
