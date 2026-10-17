@@ -205,6 +205,64 @@ pub struct PluginDescriptor {
     /// mismatch). Empty / absent on classes that don't claim a scheme.
     #[serde(default)]
     pub provides_schemes: Vec<String>,
+    /// How the watch strategies the plugin exports run as MCP Events
+    /// sources, and the event types each emits with a payload
+    /// (`WatchEvent.data`). The host binds a watch strategy as a
+    /// payload-bearing event source only when its compiled-in descriptor
+    /// declares the type, so a plugin that declares none is refused rather
+    /// than read as empty events. Empty for a plugin that exports no watch
+    /// strategy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_strategies: Vec<WatchStrategyDescriptor>,
+}
+
+/// One watch strategy a plugin exports, as an MCP Events source.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WatchStrategyDescriptor {
+    /// The strategy's `kind()`: what a config's watch strategy names.
+    pub kind: String,
+    /// Where the strategy's watch runs.
+    #[serde(default)]
+    pub placement: EventPlacement,
+    /// The watch resumes from the `upstream_cursor` it last emitted, so a
+    /// restart loses nothing.
+    #[serde(default)]
+    pub resume: bool,
+    /// The event types the strategy emits with a payload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_types: Vec<EventTypeDescriptor>,
+}
+
+/// One MCP Events type a watch strategy emits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EventTypeDescriptor {
+    /// The value the plugin puts in `WatchEvent.event_type`.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// JSON Schema of what a subscriber may pass as arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
+    /// JSON Schema of `WatchEvent.data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_schema: Option<serde_json::Value>,
+}
+
+/// Longest event type name a descriptor may declare.
+pub const MAX_EVENT_TYPE_NAME_CHARS: usize = 128;
+
+/// Where an event-source plugin's watch runs.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventPlacement {
+    /// On the events owner only: the plugin pulls from its upstream.
+    #[default]
+    SingleOwner,
+    /// On every replica: the upstream pushes to whichever replica it
+    /// reaches (an inbound webhook receiver).
+    EveryReplica,
 }
 
 impl PluginDescriptor {
@@ -214,6 +272,50 @@ impl PluginDescriptor {
     #[must_use]
     pub fn is_current_schema(&self) -> bool {
         self.schema == DESCRIPTOR_SCHEMA_V1
+    }
+
+    /// The entry of watch strategy `kind`, when the plugin declares one.
+    #[must_use]
+    pub fn watch_strategy(&self, kind: &str) -> Option<&WatchStrategyDescriptor> {
+        self.watch_strategies.iter().find(|s| s.kind == kind)
+    }
+
+    /// Check `watch_strategies`: each kind declared once, and each event
+    /// type name 1 to [`MAX_EVENT_TYPE_NAME_CHARS`] characters of
+    /// `[A-Za-z0-9._-]`, declared once across the plugin.
+    pub fn validate_watch_strategies(&self) -> Result<(), String> {
+        let mut kinds = std::collections::BTreeSet::new();
+        let mut names = std::collections::BTreeSet::new();
+        for strategy in &self.watch_strategies {
+            if strategy.kind.is_empty() || !kinds.insert(strategy.kind.as_str()) {
+                return Err(format!(
+                    "watch_strategies: kind `{}` is empty or declared twice",
+                    strategy.kind
+                ));
+            }
+            for ty in &strategy.event_types {
+                let valid = !ty.name.is_empty()
+                    && ty.name.chars().count() <= MAX_EVENT_TYPE_NAME_CHARS
+                    && ty
+                        .name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+                if !valid {
+                    return Err(format!(
+                        "watch_strategies[{}]: event type `{}` must be 1 to \
+                         {MAX_EVENT_TYPE_NAME_CHARS} characters of [A-Za-z0-9._-]",
+                        strategy.kind, ty.name
+                    ));
+                }
+                if !names.insert(ty.name.as_str()) {
+                    return Err(format!(
+                        "watch_strategies: event type `{}` is declared twice",
+                        ty.name
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -332,11 +434,79 @@ mod tests {
             tags: Vec::new(),
             provides: Vec::new(),
             provides_schemes: Vec::new(),
+            watch_strategies: vec![WatchStrategyDescriptor {
+                kind: "kafka_topic".to_owned(),
+                placement: EventPlacement::SingleOwner,
+                resume: true,
+                event_types: vec![EventTypeDescriptor {
+                    name: "kafka.record".to_owned(),
+                    description: "One record.".to_owned(),
+                    input_schema: None,
+                    payload_schema: Some(serde_json::json!({ "type": "object" })),
+                }],
+            }],
         };
         let json = serde_json::to_string(&d).unwrap();
         let back: PluginDescriptor = serde_json::from_str(&json).unwrap();
         assert_eq!(d, back);
         assert!(back.is_current_schema());
+        assert!(back.validate_watch_strategies().is_ok());
+        assert!(back.watch_strategy("kafka_topic").is_some_and(|s| s.resume));
+        assert!(back.watch_strategy("nats_topic").is_none());
+    }
+
+    #[test]
+    fn watch_strategies_are_checked() {
+        let strategy = |kind: &str, names: &[&str]| WatchStrategyDescriptor {
+            kind: kind.to_owned(),
+            placement: EventPlacement::default(),
+            resume: false,
+            event_types: names
+                .iter()
+                .map(|name| EventTypeDescriptor {
+                    name: (*name).to_owned(),
+                    description: String::new(),
+                    input_schema: None,
+                    payload_schema: None,
+                })
+                .collect(),
+        };
+        let with = |strategies: Vec<WatchStrategyDescriptor>| PluginDescriptor {
+            schema: DESCRIPTOR_SCHEMA_V1.into(),
+            id: "dev.mcpg.example".into(),
+            name: "Example".into(),
+            description: "x".into(),
+            class: PluginClass::WatchStrategy,
+            runtime: RuntimeClass::NativeCdylib,
+            protocol_version: "1.0".into(),
+            license: None,
+            required_capabilities: Vec::new(),
+            tags: Vec::new(),
+            provides: Vec::new(),
+            provides_schemes: Vec::new(),
+            watch_strategies: strategies,
+        };
+        assert!(
+            with(vec![strategy("a", &["x.one"]), strategy("b", &["x.two"])])
+                .validate_watch_strategies()
+                .is_ok()
+        );
+        for (strategies, needle) in [
+            (
+                vec![strategy("a", &[]), strategy("a", &[])],
+                "declared twice",
+            ),
+            (vec![strategy("", &[])], "empty"),
+            (
+                vec![strategy("a", &["x.one"]), strategy("b", &["x.one"])],
+                "declared twice",
+            ),
+            (vec![strategy("a", &["has space"])], "[A-Za-z0-9._-]"),
+            (vec![strategy("a", &[&"n".repeat(129)])], "1 to 128"),
+        ] {
+            let error = with(strategies).validate_watch_strategies().unwrap_err();
+            assert!(error.contains(needle), "{error}");
+        }
     }
 
     #[test]
@@ -413,6 +583,7 @@ mod tests {
             tags: Vec::new(),
             provides: Vec::new(),
             provides_schemes: Vec::new(),
+            watch_strategies: Vec::new(),
         };
         assert!(!d.is_current_schema());
         d.schema = DESCRIPTOR_SCHEMA_V1.into();

@@ -149,6 +149,36 @@
       },
       "uniqueItems": true,
       "default": []
+    },
+    "watch_strategies": {
+      "description": "How the watch strategies the plugin exports run as MCP Events sources, and the event types each emits with a payload. The host binds a watch strategy as a payload-bearing event source only when its compiled-in descriptor declares the type.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string", "minLength": 1, "description": "The strategy's kind(): what a config's watch strategy names." },
+          "placement": { "type": "string", "enum": ["single_owner", "every_replica"], "default": "single_owner" },
+          "resume": { "type": "boolean", "default": false },
+          "event_types": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["name"],
+              "properties": {
+                "name": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9._-]+$" },
+                "description": { "type": "string" },
+                "input_schema": { "type": "object" },
+                "payload_schema": { "type": "object" }
+              }
+            },
+            "default": []
+          }
+        }
+      },
+      "default": []
     }
   }
 }

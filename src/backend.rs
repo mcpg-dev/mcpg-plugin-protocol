@@ -1534,6 +1534,14 @@ pub trait WatchStrategyPlugin: Send + Sync {
     /// in the host config.
     fn kind(&self) -> &str;
 
+    /// How this strategy runs as an MCP Events source, and the event types
+    /// it emits with a payload, as its plugin's descriptor declares them.
+    /// `None` (the default) for a strategy whose plugin declares nothing:
+    /// it runs on the events owner and only reports that something changed.
+    fn event_source(&self) -> Option<crate::descriptor::WatchStrategyDescriptor> {
+        None
+    }
+
     /// Start a watcher. The plugin takes ownership of the background task(s)
     /// and calls `sink.emit(event)` on every detected change until the
     /// returned `WatchHandle` is cancelled.
@@ -1571,6 +1579,107 @@ pub struct WatchEvent {
     /// session. Consumed by session-scoped notification filters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+
+    /// The upstream event's own id, the same on every redelivery of it.
+    /// Set by a plugin that declares `event_types`; it becomes the MCP
+    /// Events `eventId` when it is header-safe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+
+    /// Which of the plugin's declared `event_types` this event is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_type: Option<String>,
+
+    /// When the event happened upstream, in RFC 3339
+    /// ([`occurred_at_from_millis`] makes one). The host takes its own
+    /// clock when this is absent or not RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<String>,
+
+    /// The event payload: the MCP Events occurrence `data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+
+    /// The position after this event, opaque to the host. A plugin that
+    /// declares `resume: true` gets the last one back in its spec under
+    /// [`WATCH_RESUME_SPEC_KEY`] when its watch restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_cursor: Option<serde_json::Value>,
+
+    /// Events before this one may be missing upstream: a resumed position
+    /// the upstream no longer holds, or changes it cannot replay. The host
+    /// records a gap before the event, so a reader is told. An event that
+    /// only reports a gap names no `event_type`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gap: bool,
+}
+
+/// The `spec` key under which a resumable event-source plugin receives the
+/// `upstream_cursor` of the last event the host stored. Reserved: the host
+/// refuses an operator spec that carries it.
+pub const WATCH_RESUME_SPEC_KEY: &str = "_mcpg_resume";
+
+/// Split a watch `spec` into the spec its plugin parses, without the
+/// reserved [`WATCH_RESUME_SPEC_KEY`], and the resume position the host put
+/// there, when it put one.
+pub fn take_watch_resume(
+    spec: &serde_json::Value,
+) -> (serde_json::Value, Option<serde_json::Value>) {
+    let mut spec = spec.clone();
+    let resume = spec
+        .as_object_mut()
+        .and_then(|object| object.remove(WATCH_RESUME_SPEC_KEY));
+    (spec, resume)
+}
+
+/// The scheme of the synthetic `resource_uri` an MCP Events source watches
+/// on: `mcpg-event://{name}`, where `name` is the gateway's configured event
+/// type (not a [`WatchEvent::event_type`]). A watch on any other URI is a
+/// resource watch, which needs only the change signal.
+pub const EVENT_SOURCE_URI_PREFIX: &str = "mcpg-event://";
+
+/// Whether a watch on `resource_uri` is an MCP Events source, which wants
+/// each event's payload; a resource watch wants only the change.
+pub fn is_event_source(resource_uri: &str) -> bool {
+    resource_uri.starts_with(EVENT_SOURCE_URI_PREFIX)
+}
+
+/// How an event body field holds a message body.
+pub mod body_encoding {
+    /// The body's JSON.
+    pub const JSON: &str = "json";
+    /// The body's UTF-8 text, as a string.
+    pub const TEXT: &str = "text";
+    /// Standard base64 of the body's bytes, as a string.
+    pub const BASE64: &str = "base64";
+}
+
+/// A message body as event `data`, and the [`body_encoding`] that says how
+/// the value holds it: its JSON when it is JSON, its text when it is UTF-8,
+/// and base64 of its bytes otherwise. The encoding travels beside the
+/// value, so a JSON body and a text or binary one never read alike.
+pub fn event_body(bytes: &[u8]) -> (serde_json::Value, &'static str) {
+    use base64::Engine as _;
+    if let Ok(value) = serde_json::from_slice(bytes) {
+        return (value, body_encoding::JSON);
+    }
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (
+            serde_json::Value::String(text.to_owned()),
+            body_encoding::TEXT,
+        ),
+        Err(_) => (
+            serde_json::Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            body_encoding::BASE64,
+        ),
+    }
+}
+
+/// A [`WatchEvent::occurred_at`] from Unix milliseconds: RFC 3339 in UTC,
+/// to the millisecond. `None` outside the range a date can hold.
+pub fn occurred_at_from_millis(millis: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(millis)
+        .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 /// Handle returned by `WatchStrategyPlugin::watch`. Dropping the handle
@@ -1581,6 +1690,17 @@ pub trait WatchHandle: Send + Sync {
     /// Stop the watcher's background tasks. After this returns, the sink
     /// will receive no further events for this handle.
     async fn cancel(&self);
+
+    /// The host is done with the event whose
+    /// [`WatchEvent::upstream_cursor`] is `position`: it is stored, or the
+    /// host dropped it for good (another event type, a payload it refuses).
+    /// A plugin that holds upstream items until then (a queue message, a
+    /// replication slot) acknowledges them now. Never called for an event
+    /// the host may want again, such as one dropped on a full queue, so the
+    /// upstream redelivers it. Called in emit order, though a position the
+    /// host could not take may be missing; never after `cancel`. Returns at
+    /// once; the plugin settles in the background.
+    async fn acknowledge(&self, _position: &serde_json::Value) {}
 }
 
 /// Errors raised by a `WatchStrategyPlugin`.
@@ -1624,6 +1744,46 @@ impl std::error::Error for WatchError {}
 mod tests {
     use super::*;
     use crate::manifest::{PluginClass, PluginManifest};
+
+    #[test]
+    fn a_body_is_json_then_text_then_base64_and_says_which() {
+        assert_eq!(
+            event_body(br#"{"a":1}"#),
+            (serde_json::json!({"a": 1}), body_encoding::JSON)
+        );
+        assert_eq!(
+            event_body(b"plain"),
+            (serde_json::json!("plain"), body_encoding::TEXT)
+        );
+        assert_eq!(
+            event_body(&[0xff, 0x00]),
+            (serde_json::json!("/wA="), body_encoding::BASE64)
+        );
+        // A JSON body that looks like another encoding still reads as JSON.
+        assert_eq!(
+            event_body(br#"{"base64":"/wA="}"#),
+            (serde_json::json!({"base64": "/wA="}), body_encoding::JSON)
+        );
+    }
+
+    #[test]
+    fn millis_become_rfc3339() {
+        assert_eq!(
+            occurred_at_from_millis(1_712_345_678_005).as_deref(),
+            Some("2024-04-05T19:34:38.005Z")
+        );
+        assert_eq!(
+            occurred_at_from_millis(-1).as_deref(),
+            Some("1969-12-31T23:59:59.999Z")
+        );
+        assert_eq!(occurred_at_from_millis(i64::MAX), None);
+    }
+
+    #[test]
+    fn only_the_synthetic_uri_is_an_event_source() {
+        assert!(is_event_source("mcpg-event://orders.created"));
+        assert!(!is_event_source("orders://all"));
+    }
 
     fn manifest(id: &str) -> PluginManifest {
         PluginManifest {
@@ -2555,7 +2715,7 @@ mod tests {
         ) -> Result<Box<dyn WatchHandle>, WatchError> {
             sink.emit(WatchEvent {
                 user_id: Some("u-1".into()),
-                session_id: None,
+                ..WatchEvent::default()
             })
             .await;
             Ok(Box::new(NoopHandle))

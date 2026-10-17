@@ -1145,6 +1145,11 @@ pub struct WatchStrategyVTable {
     /// cancel slots (`StoreVTable::cancel_watch`, etc.) and to
     /// keep raw pointers off the FFI surface.
     pub cancel: extern "C" fn(handle: RPluginHandle, cancel_token: usize),
+    /// The host is done with the event of the watch `cancel_token` whose
+    /// `upstream_cursor` is `position_json` (see
+    /// [`crate::WatchHandle::acknowledge`]). Returns at once.
+    pub acknowledge:
+        extern "C" fn(handle: RPluginHandle, cancel_token: usize, position_json: RString),
     pub shutdown: extern "C" fn(handle: RPluginHandle),
     pub drop_instance: extern "C" fn(handle: RPluginHandle),
 }
