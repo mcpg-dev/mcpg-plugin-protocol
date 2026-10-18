@@ -62,6 +62,7 @@ pub use types::*;
 // ---------------------------------------------------------------------------
 
 pub mod abi;
+pub mod abi_fingerprint;
 pub mod approval_notifier;
 pub mod audit;
 pub mod backend;
