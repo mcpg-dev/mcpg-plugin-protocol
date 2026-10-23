@@ -282,10 +282,11 @@ impl PluginDescriptor {
 
     /// Check `watch_strategies`: each kind declared once, and each event
     /// type name 1 to [`MAX_EVENT_TYPE_NAME_CHARS`] characters of
-    /// `[A-Za-z0-9._-]`, declared once across the plugin.
+    /// `[A-Za-z0-9._-]`, declared once within its strategy. Two strategies
+    /// may declare the same name: a config resolves `event_type` within the
+    /// kind its source names.
     pub fn validate_watch_strategies(&self) -> Result<(), String> {
         let mut kinds = std::collections::BTreeSet::new();
-        let mut names = std::collections::BTreeSet::new();
         for strategy in &self.watch_strategies {
             if strategy.kind.is_empty() || !kinds.insert(strategy.kind.as_str()) {
                 return Err(format!(
@@ -293,6 +294,7 @@ impl PluginDescriptor {
                     strategy.kind
                 ));
             }
+            let mut names = std::collections::BTreeSet::new();
             for ty in &strategy.event_types {
                 let valid = !ty.name.is_empty()
                     && ty.name.chars().count() <= MAX_EVENT_TYPE_NAME_CHARS
@@ -309,8 +311,8 @@ impl PluginDescriptor {
                 }
                 if !names.insert(ty.name.as_str()) {
                     return Err(format!(
-                        "watch_strategies: event type `{}` is declared twice",
-                        ty.name
+                        "watch_strategies[{}]: event type `{}` is declared twice",
+                        strategy.kind, ty.name
                     ));
                 }
             }
@@ -491,16 +493,18 @@ mod tests {
                 .validate_watch_strategies()
                 .is_ok()
         );
+        assert!(
+            with(vec![strategy("a", &["x.one"]), strategy("b", &["x.one"])])
+                .validate_watch_strategies()
+                .is_ok()
+        );
         for (strategies, needle) in [
             (
                 vec![strategy("a", &[]), strategy("a", &[])],
                 "declared twice",
             ),
             (vec![strategy("", &[])], "empty"),
-            (
-                vec![strategy("a", &["x.one"]), strategy("b", &["x.one"])],
-                "declared twice",
-            ),
+            (vec![strategy("a", &["x.one", "x.one"])], "declared twice"),
             (vec![strategy("a", &["has space"])], "[A-Za-z0-9._-]"),
             (vec![strategy("a", &[&"n".repeat(129)])], "1 to 128"),
         ] {

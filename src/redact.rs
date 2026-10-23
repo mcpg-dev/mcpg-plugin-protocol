@@ -6,6 +6,48 @@
 //! helpers strip that userinfo before a value is logged, audited, or put
 //! into an error message.
 
+/// What a caller-visible result shows in place of a request header value
+/// or a URL query value.
+pub const REDACTED: &str = "[redacted]";
+
+/// The header names of a request, each value replaced by [`REDACTED`]. A
+/// value may hold a resolved secret, credential or environment value, and
+/// once resolved nothing tells which, so every value is withheld.
+pub fn redact_header_values(
+    headers: &std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    headers
+        .keys()
+        .map(|name| (name.clone(), REDACTED.to_owned()))
+        .collect()
+}
+
+/// A request URL as a caller may see it: the userinfo removed and every
+/// query value replaced by [`REDACTED`], since either can carry a resolved
+/// secret. The scheme, host, path, query names and fragment stay.
+pub fn redact_url_for_display(url: &str) -> String {
+    let url = redact_url_password(url);
+    let (before_fragment, fragment) = match url.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (url.as_str(), None),
+    };
+    let Some((base, query)) = before_fragment.split_once('?') else {
+        return url;
+    };
+    let query = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((name, _)) => format!("{name}={REDACTED}"),
+            None => pair.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    match fragment {
+        Some(fragment) => format!("{base}?{query}#{fragment}"),
+        None => format!("{base}?{query}"),
+    }
+}
+
 /// Strip the userinfo (`user:pass@`) from a single URL, preserving the
 /// scheme, host, port, path, and query. An `@` outside the authority
 /// (in a path or query) is left intact.
@@ -96,6 +138,35 @@ fn split_trailing_punct(tok: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_values_are_withheld_and_names_kept() {
+        let headers: std::collections::BTreeMap<String, String> = [
+            ("authorization".to_owned(), "Bearer s3cret".to_owned()),
+            ("x-static".to_owned(), "plain".to_owned()),
+        ]
+        .into();
+        let shown = redact_header_values(&headers);
+        assert_eq!(shown.len(), 2);
+        assert!(shown.values().all(|v| v == REDACTED), "{shown:?}");
+        assert!(!format!("{shown:?}").contains("s3cret"));
+    }
+
+    #[test]
+    fn display_url_drops_userinfo_and_query_values() {
+        assert_eq!(
+            redact_url_for_display("https://u:p@api.test/v1/x?key=s3cret&page=2#top"),
+            "https://api.test/v1/x?key=[redacted]&page=[redacted]#top"
+        );
+        assert_eq!(
+            redact_url_for_display("https://api.test/v1/x?flag"),
+            "https://api.test/v1/x?flag"
+        );
+        assert_eq!(
+            redact_url_for_display("https://api.test/v1/x"),
+            "https://api.test/v1/x"
+        );
+    }
 
     #[test]
     fn strips_userinfo_single_url() {
