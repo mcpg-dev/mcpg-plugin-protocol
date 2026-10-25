@@ -1595,11 +1595,14 @@ pub struct ClusterVTable {
     // exposes `key_value_store()` as `Some` only for coordinators whose
     // manifest `provides` includes the `kv` role, so these slots are never
     // reached on a non-KV coordinator.
-    /// Input: JSON `KvKeyArgs` (`{key}`). Output: envelope
-    /// `Result<Option<KvEntryWire>, ClusterError>`.
+    /// Input: JSON `KvKeyArgs` (`{key, base64?}`). Output: envelope
+    /// `Result<Option<KvEntryWire>, ClusterError>`; its value is base64 when
+    /// the args set `base64`, else an array of numbers.
     pub kv_get: extern "C" fn(handle: RPluginHandle, args_json: RString) -> RString,
-    /// Input: JSON `KvPutArgs` (`{key, value, ttl_ms?}`). Output:
-    /// envelope `Result<(), ClusterError>`.
+    /// Input: JSON `KvPutArgs` (`{key, value, ttl_ms?}`); `value` is a
+    /// base64 string or an array of numbers, and the host writes base64
+    /// only to a coordinator whose manifest JSON lists `kv-value-base64`
+    /// under `wire_features`. Output: envelope `Result<(), ClusterError>`.
     pub kv_put: extern "C" fn(handle: RPluginHandle, args_json: RString) -> RString,
     /// Input: JSON `KvPutArgs`. Output: envelope
     /// `Result<bool, ClusterError>` (`true` == this caller created the
@@ -1608,10 +1611,11 @@ pub struct ClusterVTable {
     /// Input: JSON `KvKeyArgs`. Output: envelope
     /// `Result<bool, ClusterError>` (`true` == the key existed).
     pub kv_delete: extern "C" fn(handle: RPluginHandle, args_json: RString) -> RString,
-    /// Input: JSON `KvListPrefixArgs` (`{prefix, limit, page?, cursor?}`).
-    /// Output: envelope `Result<Vec<KvListEntryWire>, ClusterError>`, or,
-    /// when the args set `page`, `Result<KvPageWire, ClusterError>` — one
-    /// page and the cursor of the next. A coordinator that predates `page`
+    /// Input: JSON `KvListPrefixArgs` (`{prefix, limit, page?, cursor?,
+    /// base64?}`). Output: envelope `Result<Vec<KvListEntryWire>,
+    /// ClusterError>`, or, when the args set `page`, `Result<KvPageWire,
+    /// ClusterError>` — one page and the cursor of the next; the values are
+    /// base64 when the args set `base64`. A coordinator that predates `page`
     /// ignores it and answers with the list, which the host takes as one
     /// complete page.
     pub kv_list_prefix: extern "C" fn(handle: RPluginHandle, args_json: RString) -> RString,

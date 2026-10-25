@@ -90,6 +90,7 @@ pub mod telemetry;
 pub mod traits;
 pub mod transport;
 pub mod types;
+pub mod wire_bytes;
 
 /// Current plugin protocol version (semver).
 ///
