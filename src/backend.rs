@@ -1417,6 +1417,71 @@ pub struct IdempotencyHint {
     pub scope_hash: String,
 }
 
+/// The token and cost usage of one backend call, which a kind listed in
+/// [`crate::manifest::BackendProfile::usage_reporting_kinds`] sends with its
+/// result:
+/// the [`BackendResponse::payload`] is then the JSON object
+/// `{ USAGE_KEY: usage, USAGE_VALUE_KEY: result }`, and the gateway charges
+/// `usage` to the call's budgets and serves `result`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct BackendUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// `None` when the kind cannot price the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+}
+
+/// Payload key of the [`BackendUsage`] of a call.
+pub const USAGE_KEY: &str = "__mcpg_usage";
+/// Payload key of the result a [`BackendUsage`] travels with.
+pub const USAGE_VALUE_KEY: &str = "__mcpg_value";
+/// Request header a host sets when it takes a result with its usage; a
+/// backend sends the usage envelope only then, so a host that predates the
+/// envelope keeps receiving plain results.
+pub const ACCEPT_USAGE_HEADER: &str = "mcpg-accept-usage";
+
+impl BackendUsage {
+    /// Whether the host that sent `headers` takes a result with its usage.
+    #[must_use]
+    pub fn accepted_by(headers: &[(String, String)]) -> bool {
+        headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(ACCEPT_USAGE_HEADER))
+    }
+
+    /// The payload value that carries `result` with this usage.
+    #[must_use]
+    pub fn wrap(&self, result: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ USAGE_KEY: self, USAGE_VALUE_KEY: result })
+    }
+
+    /// Take the usage out of a payload value: the result it travels with
+    /// and the usage, or the value unchanged and `None` when it carries
+    /// none.
+    #[must_use]
+    pub fn split(value: serde_json::Value) -> (serde_json::Value, Option<Self>) {
+        let serde_json::Value::Object(mut object) = value else {
+            return (value, None);
+        };
+        if object.len() != 2 || !object.contains_key(USAGE_VALUE_KEY) {
+            return (serde_json::Value::Object(object), None);
+        }
+        let Some(usage) = object
+            .get(USAGE_KEY)
+            .and_then(|u| serde_json::from_value::<Self>(u.clone()).ok())
+        else {
+            return (serde_json::Value::Object(object), None);
+        };
+        let result = object
+            .remove(USAGE_VALUE_KEY)
+            .unwrap_or(serde_json::Value::Null);
+        (result, Some(usage))
+    }
+}
+
 /// Output of a binding execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendResponse {
@@ -1744,6 +1809,40 @@ impl std::error::Error for WatchError {}
 mod tests {
     use super::*;
     use crate::manifest::{PluginClass, PluginManifest};
+
+    #[test]
+    fn usage_travels_with_any_result_and_splits_off() {
+        let usage = BackendUsage {
+            input_tokens: 12,
+            output_tokens: 30,
+            cost_usd: Some(0.0042),
+        };
+        for result in [
+            serde_json::json!({"text": "hi"}),
+            serde_json::json!(["a", "b"]),
+            serde_json::json!("plain"),
+            serde_json::Value::Null,
+        ] {
+            let (back, got) = BackendUsage::split(usage.wrap(result.clone()));
+            assert_eq!(back, result);
+            assert_eq!(got, Some(usage));
+        }
+    }
+
+    /// A result that only looks like the envelope is served as it is.
+    #[test]
+    fn a_payload_without_the_envelope_is_left_alone() {
+        for value in [
+            serde_json::json!({"text": "hi"}),
+            serde_json::json!({ USAGE_VALUE_KEY: 1 }),
+            serde_json::json!({ USAGE_VALUE_KEY: 1, USAGE_KEY: "not usage" }),
+            serde_json::json!({ USAGE_VALUE_KEY: 1, USAGE_KEY: {}, "other": 2 }),
+        ] {
+            let (back, got) = BackendUsage::split(value.clone());
+            assert_eq!(back, value);
+            assert_eq!(got, None);
+        }
+    }
 
     #[test]
     fn a_body_is_json_then_text_then_base64_and_says_which() {

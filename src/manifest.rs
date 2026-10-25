@@ -196,6 +196,12 @@ pub struct BackendProfile {
     /// policy". The gateway does not yet run a generic spec-walk over these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transport_only_fields: Vec<String>,
+
+    /// The kinds of this plugin whose results carry the token and cost
+    /// usage of the call ([`crate::backend::BackendUsage`]), so a `cost` or
+    /// `token_count` budget on their bindings is charged. Empty: none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usage_reporting_kinds: Vec<String>,
 }
 
 /// Active health-probe strategy a backend kind declares in its

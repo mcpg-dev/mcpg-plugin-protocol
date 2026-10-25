@@ -1608,8 +1608,12 @@ pub struct ClusterVTable {
     /// Input: JSON `KvKeyArgs`. Output: envelope
     /// `Result<bool, ClusterError>` (`true` == the key existed).
     pub kv_delete: extern "C" fn(handle: RPluginHandle, args_json: RString) -> RString,
-    /// Input: JSON `KvListPrefixArgs` (`{prefix, limit}`). Output:
-    /// envelope `Result<Vec<KvListEntryWire>, ClusterError>`.
+    /// Input: JSON `KvListPrefixArgs` (`{prefix, limit, page?, cursor?}`).
+    /// Output: envelope `Result<Vec<KvListEntryWire>, ClusterError>`, or,
+    /// when the args set `page`, `Result<KvPageWire, ClusterError>` — one
+    /// page and the cursor of the next. A coordinator that predates `page`
+    /// ignores it and answers with the list, which the host takes as one
+    /// complete page.
     pub kv_list_prefix: extern "C" fn(handle: RPluginHandle, args_json: RString) -> RString,
     /// Input: JSON `KvExpireArgs` (`{key, ttl_ms?}`). Output: envelope
     /// `Result<bool, ClusterError>` (`true` == the key existed).
