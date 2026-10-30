@@ -1622,10 +1622,13 @@ pub struct ClusterVTable {
     /// Input: JSON `KvExpireArgs` (`{key, ttl_ms?}`). Output: envelope
     /// `Result<bool, ClusterError>` (`true` == the key existed).
     pub kv_expire: extern "C" fn(handle: RPluginHandle, args_json: RString) -> RString,
-    /// Input: JSON `KvIncrArgs` (`{key, delta, ttl_ms?}`). Output:
+    /// Input: JSON `KvIncrArgs` (`{key, delta, ttl_ms?, floor?}`). Output:
     /// envelope `Result<i64, ClusterError>` — the post-increment value.
     /// Atomic add-and-get: a missing key starts at 0; `ttl_ms` (when
-    /// present) re-arms the key's TTL on every call (sliding).
+    /// present) re-arms the key's TTL on every call (sliding). With
+    /// `floor`, the counter is first raised to at least `floor`, in the same
+    /// step; the host sends it only to a coordinator whose manifest JSON
+    /// lists `kv-incr-floor` under `wire_features`.
     pub kv_incr: extern "C" fn(handle: RPluginHandle, args_json: RString) -> RString,
     pub shutdown: extern "C" fn(handle: RPluginHandle),
     pub drop_instance: extern "C" fn(handle: RPluginHandle),
