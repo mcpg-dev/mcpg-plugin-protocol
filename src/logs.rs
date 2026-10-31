@@ -75,6 +75,16 @@ pub struct LogRecord {
     pub plugin_id: Option<String>,
 }
 
+/// Name of the `span_event` a native plugin sends one of its own
+/// `tracing` events under: the attrs are that event as a [`LogRecord`].
+/// It rides the existing host slot, so the vtable layout is unchanged; a
+/// host that predates it logs the record as a plain span event.
+pub const PLUGIN_LOG_EVENT: &str = "mcpg.log";
+
+/// The `tracing` target the host logs a native plugin's event under. The
+/// plugin's own target travels as the `plugin_target` field.
+pub const PLUGIN_LOG_TARGET: &str = "mcpg.plugin.log";
+
 /// Log-sink error. Kept symmetric with `TelemetryError` for
 /// operator-config uniformity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
