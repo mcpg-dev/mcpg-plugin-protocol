@@ -1392,6 +1392,22 @@ pub struct BackendRequest {
     /// here is the operator/caller-supplied key verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency: Option<IdempotencyHint>,
+
+    /// The MCP client that sent the call, as it named itself: the
+    /// `initialize` `clientInfo` of a session, or the request's
+    /// `_meta["io.modelcontextprotocol/clientInfo"]` on the stateless
+    /// wire. Self-reported, never verified — record it, do not authorize
+    /// on it. `None` when the client named none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<ClientInfo>,
+}
+
+/// An MCP client's self-reported name and version.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientInfo {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Hint carried on `BackendRequest` when the owning tool-call rode a
@@ -1957,6 +1973,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     idempotency: None,
+                    client: None,
                 },
             )
             .await
@@ -2539,6 +2556,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     idempotency: None,
+                    client: None,
                 },
             )
             .await
@@ -2708,6 +2726,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     idempotency: None,
+                    client: None,
                 },
             )
             .await
@@ -2759,6 +2778,7 @@ mod tests {
                     session_id: None,
                     identity: None,
                     idempotency: None,
+                    client: None,
                 },
             )
             .await
@@ -2899,6 +2919,7 @@ mod tests {
                 key: "01J9X8N3QKHA0V9C4D8TYR2ABC".to_owned(),
                 scope_hash: "0123456789abcdef0123456789abcdef".to_owned(),
             }),
+            client: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"idempotency\""));
@@ -2921,6 +2942,7 @@ mod tests {
             session_id: None,
             identity: None,
             idempotency: None,
+            client: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
@@ -2963,6 +2985,7 @@ mod tests {
             session_id: None,
             identity: None,
             idempotency: None,
+            client: None,
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["payload"], "aGk=", "request payload must be base64");

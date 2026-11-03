@@ -646,9 +646,16 @@ pub struct HostServicesVTable {
     pub resolve_credentials:
         extern "C" fn(ctx: usize, value_json: RString, identity_json: RString) -> RString,
 
-    /// Look up a cached response by opaque key. Returns
+    /// Look up a cached response by opaque key, for the binding named
+    /// `binding` (the call's `initiating_backend`; the host honours it
+    /// only for a binding this plugin serves). Returns
     /// `{"ok": <base64-string-or-null>}` | `{"err": <BackendHostError>}`.
-    pub cache_get: extern "C" fn(ctx: usize, key: RString) -> RString,
+    pub cache_get: extern "C" fn(ctx: usize, binding: RString, key: RString) -> RString,
+
+    /// Store a response for the binding named `binding` (as for
+    /// `cache_get`). Input is `{"key": <str>, "value": <base64>,
+    /// "ttl_ms": <u64>}`; returns `{"ok": null}` | `{"err": <BackendHostError>}`.
+    pub cache_put: extern "C" fn(ctx: usize, binding: RString, args_json: RString) -> RString,
 
     /// Fetch host-stored content (multimodal inputs) by `mcpg-resource://`
     /// URI. Returns `{"ok": <base64-string-or-null>}` (null = not found)
