@@ -956,6 +956,66 @@ pub struct DispatcherCallbackResult {
     pub reply_json: RString,
 }
 
+/// [`HttpResponderRef`] took the call.
+pub const HTTP_SINK_ACCEPTED: u8 = 0;
+/// [`HttpResponderRef`] has no room now; the host calls again with the same
+/// data later. Nothing was taken.
+pub const HTTP_SINK_FULL: u8 = 1;
+/// [`HttpResponderRef`]'s client is gone; the host stops this response and
+/// calls `end`.
+pub const HTTP_SINK_CLOSED: u8 = 2;
+
+/// The host's HTTP server, handed to `TransportVTable::start_http`.
+///
+/// Per received request the plugin calls
+/// `(server.serve)(server.ctx, head_json, body, responder)`, where
+/// `head_json` is a JSON-encoded `transport::HttpIngressRequestHead` and
+/// `body` the whole request body. `serve` returns at once: the host answers
+/// later, from its own threads, through `responder`. The returned id is
+/// what `cancel` takes; `0` means the host refused the request (it has
+/// already called `responder.end`).
+///
+/// The plugin calls `(server.cancel)(server.ctx, id)` when the client goes
+/// away before the response ends. The host then stops the response and
+/// calls `responder.end`. Unknown or finished ids are ignored.
+///
+/// `ctx` stays valid until `transport_handle_drop` returns; after that the
+/// plugin MUST NOT call `serve` or `cancel`.
+#[repr(C)]
+#[derive(StableAbi, Debug, Clone, Copy)]
+pub struct HttpServerRef {
+    pub ctx: usize,
+    pub serve: extern "C" fn(
+        ctx: usize,
+        head_json: RString,
+        body: RVec<u8>,
+        responder: HttpResponderRef,
+    ) -> u64,
+    pub cancel: extern "C" fn(ctx: usize, request_id: u64),
+}
+
+/// The plugin's sink for one HTTP response.
+///
+/// The host calls `head` once (JSON-encoded
+/// `transport::HttpIngressResponseHead`), then `chunk` for each body frame
+/// in order, then `end` exactly once: with an empty `error` when the body
+/// is complete, else with the reason the response stopped (the plugin then
+/// aborts it). `end` comes also when `head` never came, after a `cancel`,
+/// and when the host refused the request. After `end` the host never uses
+/// `ctx` again; the plugin frees its state there.
+///
+/// `head` and `chunk` return [`HTTP_SINK_ACCEPTED`], [`HTTP_SINK_FULL`] or
+/// [`HTTP_SINK_CLOSED`]. All three callbacks run on host threads and MUST
+/// NOT block.
+#[repr(C)]
+#[derive(StableAbi, Debug, Clone, Copy)]
+pub struct HttpResponderRef {
+    pub ctx: usize,
+    pub head: extern "C" fn(ctx: usize, head_json: RString) -> u8,
+    pub chunk: extern "C" fn(ctx: usize, data: RVec<u8>) -> u8,
+    pub end: extern "C" fn(ctx: usize, error: RString),
+}
+
 /// Canonical return shape for cluster-lease acquire slots
 /// (`acquire_leadership`, `acquire_lock`, plus the `try_*` variants).
 ///
@@ -1448,9 +1508,9 @@ pub struct StoreVTable {
 // callback pattern.
 //
 // Streaming replies (`DispatchResponse.stream`) are NOT carried
-// across FFI here — the dispatcher callback returns bytes-only.
-// Plumbing an `EventSinkRef`-style stream channel onto the reply
-// is possible but currently driver-blocked.
+// across FFI on the `messages` wire — the dispatcher callback returns
+// bytes-only. The `http` wire (`start_http`) streams: the host answers
+// each request through an `HttpResponderRef`, so SSE works there.
 
 #[repr(C)]
 #[derive(StableAbi, Debug)]
@@ -1488,6 +1548,18 @@ pub struct TransportVTable {
     /// string = None.
     pub transport_handle_listen_address:
         extern "C" fn(handle: RPluginHandle, transport_handle: usize) -> RString,
+    /// `transport::TransportWire` name: `"messages"` (the host calls
+    /// `start`) or `"http"` (the host calls `start_http`).
+    pub wire: extern "C" fn(handle: RPluginHandle) -> RString,
+    /// Start an `http`-wire transport. Same `StreamHandle` contract as
+    /// `start`; `metadata_json` may carry `{"listen_address": "..."}`
+    /// (for a tunnel: its public URL). Every received request goes to
+    /// `server`.
+    pub start_http: extern "C" fn(
+        handle: RPluginHandle,
+        listener_config_json: RString,
+        server: HttpServerRef,
+    ) -> StreamHandle,
     pub shutdown: extern "C" fn(handle: RPluginHandle),
     pub drop_instance: extern "C" fn(handle: RPluginHandle),
 }

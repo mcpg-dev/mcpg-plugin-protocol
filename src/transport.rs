@@ -6,6 +6,12 @@
 //! gateway's `MessageDispatcher`. Canonical built-ins: HTTP, stdio.
 //! Extension path: WebSocket, gRPC, custom protocol bridges.
 //!
+//! A transport declares its [`TransportWire`]. A `Messages` transport
+//! does the above. An `Http` transport only brings HTTP requests in (a
+//! tunnel such as ngrok, a relay, a socket the gateway does not own) and
+//! hands each whole request to the gateway's [`HttpIngressServer`]; the
+//! gateway's own HTTP router answers it.
+//!
 //! # Composition
 //!
 //! Keyed by transport name. A transport self-declares its name
@@ -162,6 +168,99 @@ pub trait MessageDispatcher: Send + Sync {
     ) -> Result<DispatchResponse, DispatcherError>;
 }
 
+/// What a transport hands the gateway.
+///
+/// - `Messages`: one JSON-RPC message per [`MessageDispatcher::dispatch`]
+///   call, keyed by a transport-assigned session id.
+/// - `Http`: whole HTTP requests through [`HttpIngressServer::serve`]. The
+///   gateway runs each one through its own HTTP router, so the identity
+///   chain, OAuth discovery, rate limits, SSE and both MCP revisions behave
+///   as on the gateway's own listener. The transport owns the connections
+///   (a tunnel, a relay, a socket the gateway does not bind).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportWire {
+    #[default]
+    Messages,
+    Http,
+}
+
+impl TransportWire {
+    /// The name on the FFI and in logs.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::Http => "http",
+        }
+    }
+
+    /// Parse the FFI name. Unknown names are `None`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "messages" => Some(Self::Messages),
+            "http" => Some(Self::Http),
+            _ => None,
+        }
+    }
+}
+
+/// The head of one request an `Http`-wire transport received.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HttpIngressRequestHead {
+    /// Request method, e.g. `POST`.
+    pub method: String,
+    /// Origin-form target: path and query, e.g. `/mcp?x=1`.
+    pub uri: String,
+    /// Header pairs in arrival order. A name can repeat.
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+    /// The client's address as `ip:port`, as the transport saw it (for a
+    /// tunnel: the address the tunnel's edge reports). Per-IP rate limits
+    /// key on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_addr: Option<String>,
+    /// The client's TLS session, when the transport terminated TLS itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<crate::types::TlsInfo>,
+}
+
+/// Head of the response to an [`HttpIngressRequestHead`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpIngressResponseHead {
+    pub status: u16,
+    #[serde(default)]
+    pub headers: Vec<(String, String)>,
+}
+
+/// Response body: data frames in order. An `Err` ends the body early; the
+/// transport aborts the response instead of completing it.
+pub type BoxBodyStream =
+    Pin<Box<dyn futures_core::Stream<Item = Result<Bytes, String>> + Send + 'static>>;
+
+/// The gateway's answer to one request.
+pub struct HttpIngressResponse {
+    pub head: HttpIngressResponseHead,
+    pub body: BoxBodyStream,
+}
+
+impl std::fmt::Debug for HttpIngressResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpIngressResponse")
+            .field("head", &self.head)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The gateway-provided HTTP server an `Http`-wire transport calls once
+/// per received request. The response body can stay open (SSE); dropping
+/// it stops the gateway's side of that response.
+#[crate::async_trait]
+pub trait HttpIngressServer: Send + Sync {
+    async fn serve(&self, head: HttpIngressRequestHead, body: Bytes) -> HttpIngressResponse;
+}
+
 /// Failure modes for transport lifecycle operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -265,6 +364,28 @@ pub trait Transport: Send + Sync {
         listener_config: &Value,
         dispatcher: std::sync::Arc<dyn MessageDispatcher>,
     ) -> Result<Box<dyn TransportHandle>, TransportError>;
+
+    /// What this transport hands the gateway. The gateway calls
+    /// [`Transport::start`] for `Messages` and [`Transport::start_http`]
+    /// for `Http`.
+    fn wire(&self) -> TransportWire {
+        TransportWire::Messages
+    }
+
+    /// Start an `Http`-wire transport: every request it receives goes to
+    /// `server`. The default refuses, for a `Messages`-wire transport.
+    async fn start_http(
+        &self,
+        _listener_config: &Value,
+        _server: std::sync::Arc<dyn HttpIngressServer>,
+    ) -> Result<Box<dyn TransportHandle>, TransportError> {
+        Err(TransportError::InvalidConfig {
+            message: format!(
+                "transport `{}` hands the gateway JSON-RPC messages, not HTTP requests",
+                self.name()
+            ),
+        })
+    }
 
     /// Called on gateway shutdown. Default is a no-op — the
     /// transport is expected to clean up when the handle returned
