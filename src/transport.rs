@@ -224,6 +224,38 @@ pub struct HttpIngressRequestHead {
     /// The client's TLS session, when the transport terminated TLS itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<crate::types::TlsInfo>,
+    /// The caller, as the transport itself established it (for a tailnet:
+    /// the owner of the peer node, as the tailnet's control server says).
+    /// The gateway uses it when the request carries no credential of its
+    /// own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer: Option<TransportPeer>,
+}
+
+/// A caller identity a transport attests. The gateway records the
+/// transport's plugin id as the identity's source, so a transport speaks
+/// only for itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransportPeer {
+    /// Who vouches for the caller, e.g. `tailscale`.
+    pub provider: String,
+    /// `verified` (the transport authenticated the caller
+    /// cryptographically) or `header_asserted` (it only names them).
+    pub trust_level: String,
+    /// The caller's stable name, e.g. a login `alice@example.com`.
+    pub subject_id: String,
+    /// The authority that issued the name, e.g. `tailscale:example.com`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    /// Further facts about the caller, e.g. the node name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub attributes: std::collections::BTreeMap<String, String>,
 }
 
 /// Head of the response to an [`HttpIngressRequestHead`].
