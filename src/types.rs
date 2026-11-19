@@ -14,15 +14,21 @@ use serde::{Deserialize, Serialize};
 pub struct PluginContext {
     /// Gateway-assigned request identifier.
     pub request_id: String,
-    /// MCP session identifier (if established).
+    /// The gateway session the call runs in. With a synthetic-session key
+    /// (`mcp.configurations.sessions.synthetic_session_key`, or one derived
+    /// from the cluster state key), a verified caller gets one id per
+    /// principal and client name, the same on every replica; any other
+    /// identified caller gets one per principal on each replica; an
+    /// anonymous HTTP caller gets a fresh id on every request; stdio uses
+    /// the process's session. The client chooses its name, so the id is
+    /// opaque: correlate on it, but key per-caller state on `identity`.
     pub session_id: Option<String>,
     /// The tool, prompt, resource, resource-template, or completion
-    /// binding being invoked. Historically this was always a tool name;
-    /// with whole-gateway mediation it carries the name of any
-    /// surface the gateway is currently dispatching.
+    /// binding being invoked: the name of the surface the gateway is
+    /// dispatching.
     pub tool_name: String,
-    /// MCP surface this invocation is serving. `"tool"` is the legacy
-    /// default; other values include `"prompt"`, `"resource"`,
+    /// MCP surface this invocation is serving. `"tool"` is the default;
+    /// other values include `"prompt"`, `"resource"`,
     /// `"resource_template"`, `"completion"`, and `"control_plane"`.
     /// Plugins that only care about tool traffic can filter on this.
     #[serde(default = "default_surface_tool")]

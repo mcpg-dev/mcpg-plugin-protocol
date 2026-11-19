@@ -1,23 +1,19 @@
-//! `transport` entity kind — the MCP wire transport itself
-//! (spec §9.6).
+//! `transport` entity kind — a listener that brings HTTP requests to
+//! the gateway (spec §9.6).
 //!
-//! A transport accepts incoming connections, parses MCP messages,
-//! identifies sessions, and hands every received message to the
-//! gateway's `MessageDispatcher`. Canonical built-ins: HTTP, stdio.
-//! Extension path: WebSocket, gRPC, custom protocol bridges.
-//!
-//! A transport declares its [`TransportWire`]. A `Messages` transport
-//! does the above. An `Http` transport only brings HTTP requests in (a
-//! tunnel such as ngrok, a relay, a socket the gateway does not own) and
-//! hands each whole request to the gateway's [`HttpIngressServer`]; the
-//! gateway's own HTTP router answers it.
+//! A transport owns the connections (a tunnel such as ngrok, a relay, a
+//! tailnet socket the gateway does not bind) and hands each whole HTTP
+//! request to the gateway's [`HttpIngressServer`]. The gateway runs it
+//! through its own HTTP router, so the identity chain, OAuth discovery,
+//! rate limits, SSE and MCP 2026-07-28 behave as on the gateway's own
+//! listener.
 //!
 //! # Composition
 //!
 //! Keyed by transport name. A transport self-declares its name
-//! (`"http-v1"`, `"stdio-v1"`, `"websocket-v1"`, ...); one name is
-//! served by exactly one active plugin. Operators enable transports
-//! via `server.transports[]` (each `{ kind: <plugin_id> }`); the
+//! (`"ngrok-v1"`, `"tailscale-v1"`, ...); one name is served by
+//! exactly one active plugin. Operators enable transports via
+//! `server.transports[]` (each `{ kind: <plugin_id> }`); the
 //! plugin's own `config:` carries any listener settings.
 //!
 //! # Not Wasm-reachable
@@ -27,14 +23,6 @@
 //! expose raw sockets, so this entity kind is native-only. Wasm
 //! plugins that need a custom transport bridge delegate to a
 //! native transport plugin.
-//!
-//! # Session identification
-//!
-//! Each transport is responsible for assigning the `session_id`
-//! it passes to `MessageDispatcher::dispatch`. HTTP uses a cookie
-//! or header; stdio uses a single synthetic id (there is one
-//! session); WebSocket uses the connection id. The gateway treats
-//! `session_id` as opaque — transports define their own mapping.
 
 use std::pin::Pin;
 
@@ -44,169 +32,7 @@ use serde_json::Value;
 
 use crate::manifest::PluginManifest;
 
-/// Stream of outbound frames for a streaming reply (SSE, WebSocket
-/// text frames, chunked HTTP). Kept as a separate alias — several
-/// entity kinds return `Bytes` streams and they all share this
-/// type name pattern.
-pub type BoxBytesStream = Pin<Box<dyn futures_core::Stream<Item = Bytes> + Send + 'static>>;
-
-/// Response returned by `MessageDispatcher::dispatch`.
-///
-/// Exactly one of `reply` / `stream` is populated:
-///   - `reply: Some(bytes)` — the message has a single reply the
-///     transport should send back (HTTP POST /messages, stdio
-///     request).
-///   - `stream: Some(stream)` — the message opens a streaming
-///     channel the transport should forward frame-by-frame (SSE
-///     subscription, long-lived WebSocket read).
-///
-/// A dispatcher returning both populated is a bug; consumers MUST
-/// treat `reply` as precedence and ignore `stream` if both are
-/// set. (The protocol defines precedence rather than panicking so
-/// that a buggy dispatcher doesn't wedge the transport.)
-pub struct DispatchResponse {
-    pub reply: Option<Bytes>,
-    pub stream: Option<BoxBytesStream>,
-}
-
-impl std::fmt::Debug for DispatchResponse {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DispatchResponse")
-            .field("reply_len", &self.reply.as_ref().map(|b| b.len()))
-            .field("has_stream", &self.stream.is_some())
-            .finish()
-    }
-}
-
-impl DispatchResponse {
-    /// Shorthand for a unary reply with no streaming channel.
-    pub fn unary(reply: impl Into<Bytes>) -> Self {
-        Self {
-            reply: Some(reply.into()),
-            stream: None,
-        }
-    }
-
-    /// Shorthand for a streaming response with no single reply.
-    pub fn streaming(stream: BoxBytesStream) -> Self {
-        Self {
-            reply: None,
-            stream: Some(stream),
-        }
-    }
-
-    /// Shorthand for an ack with no reply (fire-and-forget
-    /// notification). Transports MUST accept this — some MCP
-    /// messages are notifications.
-    pub fn ack() -> Self {
-        Self {
-            reply: None,
-            stream: None,
-        }
-    }
-}
-
-/// Errors the gateway's dispatcher returns to the transport.
-/// Kept small — the transport doesn't route on most of these; it
-/// logs + closes or re-tries per its own policy.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum DispatcherError {
-    /// No session matches `session_id` — either never existed or
-    /// expired. Transport MAY close the connection.
-    SessionNotFound,
-    /// The message bytes did not parse as MCP. Transport typically
-    /// responds to the peer with a JSON-RPC parse-error reply and
-    /// keeps the session open.
-    InvalidMessage { reason: String },
-    /// Gateway-internal failure (plugin chain panic, backend
-    /// unavailable, ...). Transport logs + keeps serving other
-    /// sessions.
-    Internal { reason: String },
-    /// Gateway is draining — don't accept new messages on this
-    /// session. Transport SHOULD close the connection gracefully.
-    Shutdown,
-}
-
-impl DispatcherError {
-    /// Bounded metrics label.
-    #[must_use]
-    pub fn kind_label(&self) -> &'static str {
-        match self {
-            Self::SessionNotFound => "session_not_found",
-            Self::InvalidMessage { .. } => "invalid_message",
-            Self::Internal { .. } => "internal",
-            Self::Shutdown => "shutdown",
-        }
-    }
-}
-
-impl std::fmt::Display for DispatcherError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::SessionNotFound => write!(f, "session not found"),
-            Self::InvalidMessage { reason } => {
-                write!(f, "invalid message: {reason}")
-            }
-            Self::Internal { reason } => write!(f, "internal: {reason}"),
-            Self::Shutdown => write!(f, "gateway shutting down"),
-        }
-    }
-}
-
-impl std::error::Error for DispatcherError {}
-
-/// The gateway-provided interface the transport calls on every
-/// received message. The gateway implements this; the transport
-/// receives it as `Arc<dyn MessageDispatcher>` in `start`.
-#[crate::async_trait]
-pub trait MessageDispatcher: Send + Sync {
-    async fn dispatch(
-        &self,
-        session_id: &str,
-        message: Bytes,
-    ) -> Result<DispatchResponse, DispatcherError>;
-}
-
-/// What a transport hands the gateway.
-///
-/// - `Messages`: one JSON-RPC message per [`MessageDispatcher::dispatch`]
-///   call, keyed by a transport-assigned session id.
-/// - `Http`: whole HTTP requests through [`HttpIngressServer::serve`]. The
-///   gateway runs each one through its own HTTP router, so the identity
-///   chain, OAuth discovery, rate limits, SSE and both MCP revisions behave
-///   as on the gateway's own listener. The transport owns the connections
-///   (a tunnel, a relay, a socket the gateway does not bind).
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TransportWire {
-    #[default]
-    Messages,
-    Http,
-}
-
-impl TransportWire {
-    /// The name on the FFI and in logs.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Messages => "messages",
-            Self::Http => "http",
-        }
-    }
-
-    /// Parse the FFI name. Unknown names are `None`.
-    #[must_use]
-    pub fn parse(name: &str) -> Option<Self> {
-        match name {
-            "messages" => Some(Self::Messages),
-            "http" => Some(Self::Http),
-            _ => None,
-        }
-    }
-}
-
-/// The head of one request an `Http`-wire transport received.
+/// The head of one request a transport received.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HttpIngressRequestHead {
     /// Request method, e.g. `POST`.
@@ -285,9 +111,9 @@ impl std::fmt::Debug for HttpIngressResponse {
     }
 }
 
-/// The gateway-provided HTTP server an `Http`-wire transport calls once
-/// per received request. The response body can stay open (SSE); dropping
-/// it stops the gateway's side of that response.
+/// The gateway-provided HTTP server a transport calls once per received
+/// request. The response body can stay open (SSE); dropping it stops the
+/// gateway's side of that response.
 #[crate::async_trait]
 pub trait HttpIngressServer: Send + Sync {
     async fn serve(&self, head: HttpIngressRequestHead, body: Bytes) -> HttpIngressResponse;
@@ -300,7 +126,7 @@ pub enum TransportError {
     /// Binding the listener failed (port in use, permission
     /// denied, invalid address, ...).
     BindFailed { reason: String },
-    /// `start` called twice without an intervening `close` on the
+    /// `start_http` called twice without an intervening `close` on the
     /// previous handle. Most transport implementations are
     /// single-instance per process.
     AlreadyListening,
@@ -355,19 +181,18 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-/// Handle returned from `Transport::start`. Dropping the handle
-/// or calling `close` stops accepting new sessions; already-
-/// in-flight sessions complete at the transport's own cadence.
+/// Handle returned from `Transport::start_http`. Dropping the handle
+/// or calling `close` stops accepting new connections; requests
+/// already in flight complete at the transport's own cadence.
 #[crate::async_trait]
 pub trait TransportHandle: Send + Sync {
-    /// Operator-visible listen address (e.g. `"0.0.0.0:8080"` for
-    /// HTTP, `"stdio"` for stdio). `None` for transports without
-    /// a meaningful address.
+    /// Operator-visible listen address (for a tunnel: its public
+    /// URL). `None` for transports without a meaningful address.
     async fn listen_address(&self) -> Option<String>;
 
-    /// Stop accepting new sessions. Idempotent — multiple calls
-    /// are safe. Returns when the listener is closed; in-flight
-    /// sessions may still complete after this returns.
+    /// Stop accepting new connections. Idempotent — multiple calls
+    /// are safe. Returns when the listener is closed; requests in
+    /// flight may still complete after this returns.
     async fn close(&self);
 }
 
@@ -377,51 +202,26 @@ pub trait TransportHandle: Send + Sync {
 pub trait Transport: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
 
-    /// Self-declared transport name (e.g. `"http-v1"`,
-    /// `"stdio-v1"`, `"websocket-v1"`). Registry refuses a
-    /// duplicate plugin for the same name.
+    /// Self-declared transport name (e.g. `"ngrok-v1"`). Registry
+    /// refuses a duplicate plugin for the same name.
     fn name(&self) -> &str;
 
-    /// Start accepting sessions. `listener_config` is the operator-
-    /// supplied opaque config for this transport (HTTP bind
-    /// address + TLS certs, stdio line delimiter, ...); the
-    /// transport parses it per its own contract. `dispatcher` is
-    /// the gateway-supplied callback the transport invokes on
-    /// every received message.
+    /// Start accepting connections. `listener_config` is the
+    /// operator-supplied opaque config for this transport; the
+    /// transport parses it per its own contract. Every request it
+    /// receives goes to `server`.
     ///
-    /// Returns a `TransportHandle` whose drop (or explicit
-    /// `close`) stops the listener.
-    async fn start(
-        &self,
-        listener_config: &Value,
-        dispatcher: std::sync::Arc<dyn MessageDispatcher>,
-    ) -> Result<Box<dyn TransportHandle>, TransportError>;
-
-    /// What this transport hands the gateway. The gateway calls
-    /// [`Transport::start`] for `Messages` and [`Transport::start_http`]
-    /// for `Http`.
-    fn wire(&self) -> TransportWire {
-        TransportWire::Messages
-    }
-
-    /// Start an `Http`-wire transport: every request it receives goes to
-    /// `server`. The default refuses, for a `Messages`-wire transport.
+    /// Returns a `TransportHandle` whose drop (or explicit `close`)
+    /// stops the listener.
     async fn start_http(
         &self,
-        _listener_config: &Value,
-        _server: std::sync::Arc<dyn HttpIngressServer>,
-    ) -> Result<Box<dyn TransportHandle>, TransportError> {
-        Err(TransportError::InvalidConfig {
-            message: format!(
-                "transport `{}` hands the gateway JSON-RPC messages, not HTTP requests",
-                self.name()
-            ),
-        })
-    }
+        listener_config: &Value,
+        server: std::sync::Arc<dyn HttpIngressServer>,
+    ) -> Result<Box<dyn TransportHandle>, TransportError>;
 
     /// Called on gateway shutdown. Default is a no-op — the
     /// transport is expected to clean up when the handle returned
-    /// from `start` is dropped.
+    /// from `start_http` is dropped.
     async fn shutdown(&self) {}
 }
 
@@ -468,29 +268,6 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_error_kind_label_bounded() {
-        assert_eq!(
-            DispatcherError::SessionNotFound.kind_label(),
-            "session_not_found"
-        );
-        assert_eq!(
-            DispatcherError::InvalidMessage {
-                reason: "not JSON".into()
-            }
-            .kind_label(),
-            "invalid_message"
-        );
-        assert_eq!(
-            DispatcherError::Internal {
-                reason: "panic".into()
-            }
-            .kind_label(),
-            "internal"
-        );
-        assert_eq!(DispatcherError::Shutdown.kind_label(), "shutdown");
-    }
-
-    #[test]
     fn transport_error_display_includes_detail() {
         let e = TransportError::BindFailed {
             reason: "address already in use".into(),
@@ -504,44 +281,12 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_error_display_includes_detail() {
-        let e = DispatcherError::InvalidMessage {
-            reason: "unterminated string".into(),
-        };
-        assert!(e.to_string().contains("unterminated string"));
-    }
-
-    #[test]
-    fn dispatch_response_unary_ok() {
-        let r = DispatchResponse::unary(b"pong".to_vec());
-        assert_eq!(r.reply.as_deref(), Some(b"pong".as_slice()));
-        assert!(r.stream.is_none());
-    }
-
-    #[test]
-    fn dispatch_response_ack_has_neither() {
-        let r = DispatchResponse::ack();
-        assert!(r.reply.is_none());
-        assert!(r.stream.is_none());
-    }
-
-    #[test]
     fn transport_error_json_roundtrip() {
         let e = TransportError::InvalidConfig {
             message: "listener_config has no bind".into(),
         };
         let s = serde_json::to_string(&e).unwrap();
         let back: TransportError = serde_json::from_str(&s).unwrap();
-        assert_eq!(e, back);
-    }
-
-    #[test]
-    fn dispatcher_error_json_roundtrip() {
-        let e = DispatcherError::Internal {
-            reason: "plugin panicked".into(),
-        };
-        let s = serde_json::to_string(&e).unwrap();
-        let back: DispatcherError = serde_json::from_str(&s).unwrap();
         assert_eq!(e, back);
     }
 }

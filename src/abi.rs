@@ -915,47 +915,6 @@ pub struct StreamHandle {
     pub metadata_json: RString,
 }
 
-/// Bidirectional callback handed to a `TransportVTable::start`.
-/// The plugin invokes this per incoming MCP message to dispatch
-/// into the gateway + get back the reply. Unlike the one-way
-/// `EventSinkRef`, this is request/response: the callback
-/// SYNCHRONOUSLY returns a `DispatcherCallbackResult`.
-///
-/// Plugin calls:
-///   `(cb.dispatch)(cb.ctx, session_id, message_json)`
-/// where `message_json` is a JSON-encoded `{"bytes": Vec<u8>}`
-/// object; the return's `reply_json` is JSON-encoded
-/// `{"ok": {"bytes": Vec<u8>}}` or `{"err": DispatcherError}`.
-///
-/// Streaming replies (`DispatchResponse.stream`) are not carried
-/// through this callback — the host wraps the
-/// streaming dispatcher in a bytes-only façade and returns
-/// `{"err": DispatcherError::Internal { reason: "stream reply
-/// not supported across FFI" }}` if a stream is produced.
-/// Streaming on top of this could later be layered via `EventSinkRef`.
-#[repr(C)]
-#[derive(StableAbi, Debug, Clone, Copy)]
-pub struct DispatcherCallbackRef {
-    pub ctx: usize,
-    pub dispatch: extern "C" fn(
-        ctx: usize,
-        session_id: RString,
-        message_json: RString,
-    ) -> DispatcherCallbackResult,
-}
-
-/// Return shape for `DispatcherCallbackRef::dispatch`. Holds a
-/// JSON-encoded `Result<DispatchReplyWire, DispatcherError>` via
-/// the `{"ok", "err"}` convention. Wrapped as a struct (rather
-/// than just returning `RString`) to let future revisions add
-/// fields (streaming-reply handle, etc.) without breaking the
-/// `extern "C"` signature.
-#[repr(C)]
-#[derive(StableAbi, Debug)]
-pub struct DispatcherCallbackResult {
-    pub reply_json: RString,
-}
-
 /// [`HttpResponderRef`] took the call.
 pub const HTTP_SINK_ACCEPTED: u8 = 0;
 /// [`HttpResponderRef`] has no room now; the host calls again with the same
@@ -1501,16 +1460,10 @@ pub struct StoreVTable {
 // Transport vtable
 // ---------------------------------------------------------------------------
 //
-// Unlike every earlier kind, transport's `start` takes a
-// host-provided callback (the gateway's `MessageDispatcher`)
-// AND returns an opaque lifecycle handle: it composes the
-// cluster-lease trait-object pattern with a new bidirectional
-// callback pattern.
-//
-// Streaming replies (`DispatchResponse.stream`) are NOT carried
-// across FFI on the `messages` wire — the dispatcher callback returns
-// bytes-only. The `http` wire (`start_http`) streams: the host answers
-// each request through an `HttpResponderRef`, so SSE works there.
+// `start_http` takes the host's HTTP server (`HttpServerRef`) AND
+// returns an opaque lifecycle handle. The host answers each request
+// through the plugin's `HttpResponderRef`, so response bodies stream
+// (SSE).
 
 #[repr(C)]
 #[derive(StableAbi, Debug)]
@@ -1521,25 +1474,22 @@ pub struct TransportVTable {
         inner_name: RString,
     ) -> RPluginHandle,
     pub manifest_json: extern "C" fn(handle: RPluginHandle) -> RString,
-    /// Self-declared transport name (`"http-v1"`, `"stdio-v1"`,
-    /// …). Host refuses duplicate registrations.
+    /// Self-declared transport name (`"ngrok-v1"`, …). Host refuses
+    /// duplicate registrations.
     pub name: extern "C" fn(handle: RPluginHandle) -> RString,
-    /// Start accepting sessions. Input: JSON-encoded
-    /// `listener_config` + the dispatcher callback ref. Returns
-    /// a `StreamHandle`: `handle != 0` ⇒ success, `metadata_json`
-    /// carries `{"listen_address": "..."}` (or `""` if the
-    /// transport has no listen address); `handle == 0` ⇒
-    /// `error_json` holds JSON-encoded `TransportError`.
-    /// Plugin MUST call `dispatcher_cb.dispatch(...)` synchronously
-    /// per received message and return the reply bytes.
-    /// (Consolidated onto `StreamHandle` in v27, from the former
-    /// `TransportStartResult` shape.)
-    pub start: extern "C" fn(
+    /// Start accepting connections. Input: JSON-encoded
+    /// `listener_config` + the host's HTTP server. Returns a
+    /// `StreamHandle`: `handle != 0` ⇒ success, `metadata_json`
+    /// carries `{"listen_address": "..."}` (for a tunnel: its public
+    /// URL; `""` if the transport has no listen address);
+    /// `handle == 0` ⇒ `error_json` holds JSON-encoded
+    /// `TransportError`. Every received request goes to `server`.
+    pub start_http: extern "C" fn(
         handle: RPluginHandle,
         listener_config_json: RString,
-        dispatcher_cb: DispatcherCallbackRef,
+        server: HttpServerRef,
     ) -> StreamHandle,
-    /// Stop accepting new sessions. Idempotent.
+    /// Stop accepting new connections. Idempotent.
     pub transport_handle_close: extern "C" fn(handle: RPluginHandle, transport_handle: usize),
     /// Free plugin-side transport-handle state. Called by the host
     /// after the owner `Box<dyn TransportHandle>` is dropped.
@@ -1548,34 +1498,9 @@ pub struct TransportVTable {
     /// string = None.
     pub transport_handle_listen_address:
         extern "C" fn(handle: RPluginHandle, transport_handle: usize) -> RString,
-    /// `transport::TransportWire` name: `"messages"` (the host calls
-    /// `start`) or `"http"` (the host calls `start_http`).
-    pub wire: extern "C" fn(handle: RPluginHandle) -> RString,
-    /// Start an `http`-wire transport. Same `StreamHandle` contract as
-    /// `start`; `metadata_json` may carry `{"listen_address": "..."}`
-    /// (for a tunnel: its public URL). Every received request goes to
-    /// `server`.
-    pub start_http: extern "C" fn(
-        handle: RPluginHandle,
-        listener_config_json: RString,
-        server: HttpServerRef,
-    ) -> StreamHandle,
     pub shutdown: extern "C" fn(handle: RPluginHandle),
     pub drop_instance: extern "C" fn(handle: RPluginHandle),
 }
-
-// ---------------------------------------------------------------------------
-// PolicyEngine vtable
-// ---------------------------------------------------------------------------
-//
-// Transport was originally blocked from landing alongside this kind:
-// its `start(config, dispatcher)` signature takes an
-// `Arc<dyn MessageDispatcher>` callback (host → transport on every
-// received message) AND returns a `Box<dyn TransportHandle>`, both of
-// which needed the callback-channel-across-FFI infrastructure that the
-// streaming-FFI work later built once and shared across every kind
-// that needs it (store.watch, secret.watch, config.watch,
-// cluster.subscribe, and transport — see `TransportVTable` above).
 
 // ---------------------------------------------------------------------------
 // Cluster vtable
@@ -3057,14 +2982,13 @@ where
 // A sentinel-struct return is a `#[repr(C)]` shape where one field
 // distinguishes "success" from "failure" (e.g. `handle != 0`) and a
 // sibling field carries the JSON-encoded error on the failure branch.
-// These cover the five FFI return shapes that don't fit the simpler
+// These cover the FFI return shapes that don't fit the simpler
 // `null-handle | empty-rstring` panic pattern: `LeaseHandle`,
-// `StreamHandle`, `HttpHandleResult`,
-// `DispatcherCallbackResult`. (`StreamHandle` covers both
+// `StreamHandle` and `HttpHandleResult`. (`StreamHandle` covers both
 // stream-subscription and transport returns.)
 //
 // On panic each helper returns a struct that carries the established
-// "failure" sentinel value AND an `error_json` (or `reply_json`) field
+// "failure" sentinel value AND an `error_json` (or `head_json`) field
 // containing the panic message. Downstream host adapters already
 // surface these failures as `Internal { reason }` errors — the panic
 // guard just keeps the FFI boundary safe. Callers who want richer
@@ -3081,27 +3005,13 @@ pub const PANIC_LEASE_MSG: &str = "plugin panicked during lease acquire";
 pub const PANIC_STREAM_MSG: &str = "plugin panicked during stream subscription";
 
 /// Sentinel `error_json` substring on a panic-guarded
-/// [`StreamHandle`] returned from a transport `start` slot.
+/// [`StreamHandle`] returned from a transport `start_http` slot.
 pub const PANIC_TRANSPORT_MSG: &str = "plugin panicked during transport start";
 
 /// Sentinel `head_json` substring on a panic-guarded
 /// `HttpHandleResult`. The host's HTTP-route adapter detects this and
 /// returns a 500 response to the caller.
 pub const PANIC_HTTP_MSG: &str = "plugin panicked during http handle";
-
-/// Sentinel `reply_json` substring on a panic-guarded
-/// `DispatcherCallbackResult`. The host parses `reply_json` as a
-/// `Result<DispatchReplyWire, DispatcherError>` JSON envelope; this
-/// constant is encoded into the err arm so the gateway surfaces a
-/// clean `DispatcherError::Internal { reason }`.
-pub const PANIC_DISPATCHER_MSG: &str = "plugin panicked during dispatcher callback";
-
-/// JSON envelope returned from a panicked dispatcher callback.
-/// Matches the shape `{"err": {"Internal": {"reason": ...}}}` the host
-/// adapter expects for failed dispatches.
-fn panicked_dispatcher_reply() -> RString {
-    RString::from(r#"{"err":{"Internal":{"reason":"plugin panicked during dispatcher callback"}}}"#)
-}
 
 /// Run `f` inside `catch_unwind`; on panic return a
 /// [`LeaseHandle`] with `handle == 0` and `error_json` set to the
@@ -3145,7 +3055,7 @@ where
 /// Run `f` inside `catch_unwind`; on panic return a
 /// [`StreamHandle`] with `handle == 0`, empty `metadata_json`,
 /// and `error_json` set to the panic sentinel. Intended for the body
-/// of `TransportVTable::start` — transports return the
+/// of `TransportVTable::start_http` — transports return the
 /// same `StreamHandle` shape as subscriptions, with the listen
 /// address (when present) encoded into `metadata_json`.
 pub fn catch_panic_to_transport_failure<F>(f: F) -> StreamHandle
@@ -3177,23 +3087,6 @@ where
         Err(_) => HttpHandleResult {
             handle: 0,
             head_json: RString::from(PANIC_HTTP_MSG),
-        },
-    }
-}
-
-/// Run `f` inside `catch_unwind`; on panic return a
-/// `DispatcherCallbackResult` whose `reply_json` is a serialised
-/// `Result::Err(DispatcherError::Internal { reason: ... })` envelope.
-/// Intended for the dispatcher-callback path on
-/// `TransportVTable::start`.
-pub fn catch_panic_to_dispatcher_failure<F>(f: F) -> DispatcherCallbackResult
-where
-    F: FnOnce() -> DispatcherCallbackResult,
-{
-    match catch_unwind(AssertUnwindSafe(f)) {
-        Ok(r) => r,
-        Err(_) => DispatcherCallbackResult {
-            reply_json: panicked_dispatcher_reply(),
         },
     }
 }
@@ -3630,24 +3523,6 @@ mod tests {
             r.head_json.as_str().contains(PANIC_HTTP_MSG),
             "got: {}",
             r.head_json
-        );
-    }
-
-    #[test]
-    fn catch_panic_to_dispatcher_failure_returns_internal_err_envelope() {
-        let r = catch_panic_to_dispatcher_failure(|| panic!("boom"));
-        assert!(
-            r.reply_json.as_str().contains(PANIC_DISPATCHER_MSG),
-            "got: {}",
-            r.reply_json
-        );
-        // Confirm the wire shape parses as a Result::Err envelope
-        // matching what the host's dispatcher adapter expects.
-        let parsed: serde_json::Value = serde_json::from_str(r.reply_json.as_str())
-            .expect("dispatcher panic reply must be valid JSON");
-        assert!(
-            parsed.pointer("/err/Internal/reason").is_some(),
-            "expected /err/Internal/reason in {parsed}"
         );
     }
 

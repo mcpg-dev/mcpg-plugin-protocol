@@ -4,9 +4,10 @@
 //! policy/shape-shifting to existing dispatch, **backend plugins** extend the
 //! set of transports MCPG can dispatch to (NATS, Kafka, MQTT, …) and
 //! **watch-strategy plugins** extend the set of change-detection sources
-//! behind `resources/subscribe`. Operators address backend plugins by `kind`
-//! in their YAML (`kind: nats` on a flattened backend spec) and watch plugins
-//! by strategy discriminator (`watch.strategy.type: nats_topic`).
+//! behind the resource targets of `subscriptions/listen`. Operators address
+//! backend plugins by `kind` in their YAML (`kind: nats` on a flattened
+//! backend spec) and watch plugins by strategy discriminator
+//! (`watch.strategy.type: nats_topic`).
 //!
 //! Each plugin declares the kind(s) it handles via [`BackendPlugin::kind`] /
 //! [`WatchStrategyPlugin::kind`]; the host routes dispatch/subscription to
@@ -388,7 +389,8 @@ pub struct BackendInvocationContext {
     /// Gateway-assigned identifier for the originating tool call.
     /// Propagated unchanged across the chain so all child events share it.
     pub parent_request_id: String,
-    /// Session identifier when the originating call is session-bound.
+    /// The originating call's gateway session (see
+    /// [`crate::PluginContext::session_id`]).
     pub session_id: Option<String>,
     /// Name of the binding initiating this child invocation.
     /// Used for audit attribution and cycle detection.
@@ -1365,7 +1367,8 @@ pub struct BackendRequest {
     /// Gateway-assigned request identifier — useful for correlation logs.
     pub request_id: String,
 
-    /// Session identifier if the request is session-bound.
+    /// The call's gateway session (see
+    /// [`crate::PluginContext::session_id`]).
     pub session_id: Option<String>,
 
     /// Caller identity at the time of dispatch. Threaded so adapters that
@@ -1393,11 +1396,10 @@ pub struct BackendRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency: Option<IdempotencyHint>,
 
-    /// The MCP client that sent the call, as it named itself: the
-    /// `initialize` `clientInfo` of a session, or the request's
-    /// `_meta["io.modelcontextprotocol/clientInfo"]` on the stateless
-    /// wire. Self-reported, never verified — record it, do not authorize
-    /// on it. `None` when the client named none.
+    /// The MCP client that sent the call, as it named itself in the
+    /// request's `_meta["io.modelcontextprotocol/clientInfo"]`.
+    /// Self-reported, never verified — record it, do not authorize on
+    /// it. `None` when the client named none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<ClientInfo>,
 }
@@ -1600,8 +1602,8 @@ impl std::error::Error for BackendError {}
 /// "url": "nats://..." }`), the plugin spawns background tasks that watch
 /// the external source. Whenever a change is observed, it calls
 /// `sink.emit(event)` so the host can fan out `notifications/resources/updated`
-/// to subscribed MCP sessions, honoring subject-scoped filters via
-/// `WatchEvent::user_id` / `session_id`.
+/// to the `subscriptions/listen` streams that name the resource, honoring
+/// subject-scoped filters via `WatchEvent::user_id` / `session_id`.
 ///
 /// The plugin returns a `WatchHandle` the host uses to cancel the watcher
 /// (e.g. when the last subscriber disconnects or on shutdown).
@@ -1656,8 +1658,8 @@ pub struct WatchEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
 
-    /// Originating MCP session when the change was triggered by a known
-    /// session. Consumed by session-scoped notification filters.
+    /// Originating gateway session when a known session triggered the
+    /// change. Consumed by session-scoped notification filters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
 
