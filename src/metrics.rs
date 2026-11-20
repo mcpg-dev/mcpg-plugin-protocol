@@ -82,9 +82,10 @@ impl std::error::Error for MetricsError {}
 pub trait MetricsSink: Send + Sync {
     fn manifest(&self) -> &PluginManifest;
 
-    /// Emit one metric data point. Best-effort — drop-on-overflow
-    /// is acceptable behaviour for a metrics sink. Sinks that need
-    /// rollups compute them from these raw samples.
+    /// Emit one aggregated point of one series: a counter's increase
+    /// since its previous point (add it), a gauge's current value
+    /// (replace), or a histogram's exact `count` and `sum` with a
+    /// sample of at most 64 `observations` (`count` may be larger).
     async fn emit(&self, metric: &MetricPoint);
 
     /// Force a flush. Called on graceful shutdown + on admin
