@@ -1404,10 +1404,13 @@ pub struct BackendRequest {
     pub client: Option<ClientInfo>,
 }
 
-/// An MCP client's self-reported name and version.
+/// An MCP client's self-reported name, title and version.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientInfo {
     pub name: String,
+    /// The client's display name; some clients put an instance name here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
